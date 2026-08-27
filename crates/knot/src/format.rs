@@ -214,7 +214,7 @@ pub fn render_type(t: &Type) -> String {
 }
 
 /// Render an expression back to Knot source syntax (inline). Used by the
-/// schema lockfile, which synthesizes `migrate *name … using <fn>` lines for
+/// schema lockfile, which synthesizes the migration-clause lines for
 /// migrations attached to record-embedded source fields.
 pub fn render_expr_source(e: &Expr) -> String {
     render_expr_inline(e, Prec::Lowest)
@@ -846,11 +846,11 @@ fn render_expr_inline(e: &Expr, parent: Prec) -> String {
         } => {
             // Renders the embedded source line. The field is literally named
             // `*name`; here we emit the type-first `Type  *name` declaration,
-            // plus any attached migration clauses.
+            // plus the migration clause (a bare lambda) on an indented line.
             let mut s = format!("{}  *{}", render_type(ty), name);
             for m in migrations {
                 s.push_str(&format!(
-                    " migrate from _ using {}",
+                    "\n  {}",
                     render_expr_inline(&m.using_fn, Prec::Lowest)
                 ));
             }

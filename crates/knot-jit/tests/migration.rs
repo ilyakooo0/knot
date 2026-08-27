@@ -2,7 +2,8 @@
 //!
 //! The lock (`<name>.schema.lock`) is the append-only, build-input owner of
 //! migration history. Source holds only the current schema plus at most one
-//! pending `migrate from _ using …` block (the old schema is derived from the lock).
+//! pending migration clause — a bare `\old -> …` lambda under the `Rel` decl
+//! (the old schema is derived from the lock).
 //! `knot lock` snapshots schemas and promotes pending migrations into the
 //! lock, stripping the clause from source. A binary carrying an uncommitted
 //! migration opens a content-hashed FORK of the database, never touching the
@@ -49,7 +50,7 @@ Active  Yes {}  No {}
 PersonV1  {name Text}
 PersonV2  {name Text  active Active}
 Rel PersonV2  *people
-  migrate from _ using \p -> {name p.name  active (Active.Yes {})}
+  \p -> {name p.name  active (Active.Yes {})}
 }
 (do
   rows <- *people
@@ -198,7 +199,7 @@ Active  Yes {}  No {}
 PersonV1  {name Text}
 PersonV2  {name Text  active Active}
 Rel PersonV2  *people
-  migrate from _ using \p -> {wrongfield p.name}
+  \p -> {wrongfield p.name}
 }
 (do
   yield {})"#;
@@ -226,7 +227,7 @@ Active  Yes {}  No {}
 PersonV1  {name Text}
 PersonV2  {name Text  active Active}
 Rel PersonV2  *people
-  migrate from _ using \p -> {name p.nonexistent  active (Active.Yes {})}
+  \p -> {name p.nonexistent  active (Active.Yes {})}
 }
 (do
   yield {})"#;
@@ -299,8 +300,8 @@ V1  {name Text}
 V2  {name Text  active Text}
 V3  {name Text  active Text  extra Text}
 Rel V3  *people
-  migrate from _ using \p -> {name p.name  active "yes"}
-  migrate from _ using \p -> {name p.name  active p.active  extra "x"}
+  \p -> {name p.name  active "yes"}
+  \p -> {name p.name  active p.active  extra "x"}
 }
 (do
   yield {})"#;
@@ -316,7 +317,7 @@ Rel V3  *people
         .expect("knot build");
     assert!(!build.status.success(), "two pending migrations must fail the build");
     assert!(
-        String::from_utf8_lossy(&build.stderr).contains("more than one pending `migrate` clause"),
+        String::from_utf8_lossy(&build.stderr).contains("more than one pending migration clause"),
         "build error names the problem: {}",
         String::from_utf8_lossy(&build.stderr)
     );
@@ -329,7 +330,7 @@ Rel V3  *people
         .expect("knot lock");
     assert!(!lock.status.success(), "two pending migrations must fail the lock");
     assert!(
-        String::from_utf8_lossy(&lock.stderr).contains("more than one pending `migrate` clause"),
+        String::from_utf8_lossy(&lock.stderr).contains("more than one pending migration clause"),
         "lock error names the problem: {}",
         String::from_utf8_lossy(&lock.stderr)
     );
@@ -360,7 +361,7 @@ Rel V1  *people
 V1  {name Text}
 V2  {name Text  active Text}
 Rel V2  *people
-  migrate from _ using \p -> {name p.name  active "UP"}
+  \p -> {name p.name  active "UP"}
 }
 (do
   yield {})"#;
@@ -372,7 +373,7 @@ Rel V2  *people
 V1  {name Text}
 V2  {name Text  active Text}
 Rel V1  *people
-  migrate from _ using \p -> {name p.name}
+  \p -> {name p.name}
 }
 (do
   yield {})"#;

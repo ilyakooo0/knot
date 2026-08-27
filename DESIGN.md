@@ -1374,39 +1374,39 @@ The source file holds **only the current schema** — never migration history. T
 
 A source's schema lives only in source. To change it:
 
-1. **Edit the schema** and add a pending `migrate to New using <fn>` block. There is **no `from`** — it is derived from the lock's last recorded schema. `using` is a hand-written function applied to each stored row (no auto-derived transforms).
-2. **`knot build`** reads the lock as a build input. A pending migration produces an **uncommitted-migration warning**; the binary bakes the committed chain plus the pending step. Running it applies the migration on a **fork** of the database (a content-hashed copy), so the **main DB is never touched** by uncommitted work. Re-running the same pending migration reuses the fork; editing the `using` fn forks fresh.
-3. **`knot lock`** commits: it appends the migration to the lock's `migrate_history`, snapshots the current schema, and strips the `migrate` block from source. The next run of the committed binary fast-forwards the **main** DB through the locked chain.
+1. **Edit the schema** and add a pending migration clause — a bare lambda `\old -> <new row>` directly under the `Rel` declaration. There is **no `from`** — it is derived from the lock's last recorded schema. The lambda is a hand-written function applied to each stored row (no auto-derived transforms).
+2. **`knot build`** reads the lock as a build input. A pending migration produces an **uncommitted-migration warning**; the binary bakes the committed chain plus the pending step. Running it applies the migration on a **fork** of the database (a content-hashed copy), so the **main DB is never touched** by uncommitted work. Re-running the same pending migration reuses the fork; editing the lambda forks fresh.
+3. **`knot lock`** commits: it appends the migration to the lock's `migrate_history`, snapshots the current schema, and strips the migration clause from source. The next run of the committed binary fast-forwards the **main** DB through the locked chain.
 
 On each compile, the compiler diffs the source schema against the lock's last schema:
 
 | Change | Compiler action |
 |--------|-----------------|
-| Schema unchanged | OK (a staged `migrate` block here is an error) |
-| Schema changed + pending `migrate` block | Warning: uncommitted migration (run `knot lock`) |
-| Schema changed, no `migrate` block | Error: schema change requires a migrate block |
+| Schema unchanged | OK (a staged migration clause here is an error) |
+| Schema changed + pending migration clause | Warning: uncommitted migration (run `knot lock`) |
+| Schema changed, no migration clause | Error: schema change requires a migration clause |
 | Remove relation | Warning (data will be orphaned) |
 
-There are no "safe" auto-applied changes — **every** schema change is an explicit migration with a hand-written `using` function.
+There are no "safe" auto-applied changes — **every** schema change is an explicit migration with a hand-written lambda.
 
 ### Migrations
 
-A change requires a `migrate` block naming only the target:
+A change requires a migration clause on the source — a bare lambda, no keywords:
 
 ```knot
 Person  {name Text  age (Int 1)  email Text}
 
 Rel Person  *people
-  migrate to Person using \old -> {name old.name  age old.age  email (old.name ++ "@unknown.com")}
+  \old -> {name old.name  age old.age  email (old.name ++ "@unknown.com")}
 ```
 
-The `using` function is type-checked against the lock's last schema (its input) and the new source schema (its output).
+The lambda is type-checked against the lock's last schema (its input) and the new source schema (its output).
 
 ### Runtime
 
 The runtime stores each source's schema in the database. On startup the binary applies its baked migration chain (committed + pending) in order, skipping already-applied steps. With a pending migration present, the binary opens a content-hashed **fork** of the database instead of the main file and logs a warning; the main DB is only migrated once the migration is committed via `knot lock` and the binary rebuilt.
 
-Committed history is append-only: `knot lock` only ever adds to `migrate_history`. A source holds at most one pending `migrate` block at a time — rewriting it before locking replaces the single pending jump (last-locked → current). History is never edited or removed by the tooling.
+Committed history is append-only: `knot lock` only ever adds to `migrate_history`. A source holds at most one pending migration clause at a time — rewriting it before locking replaces the single pending jump (last-locked → current). History is never edited or removed by the tooling.
 
 ## Type System
 

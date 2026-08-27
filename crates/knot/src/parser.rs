@@ -22,11 +22,6 @@ pub struct Parser {
     /// response type, where the next line's leading `Upper` is the next route's
     /// constructor name, never a type argument.
     stop_type_app_at_route_entry: bool,
-    /// When true, `can_start_type_atom` returns false for `Lower("to")` and
-    /// `Lower("using")`. Used while parsing the `from`/`to` types of a
-    /// `migrate` declaration so a single-line migrate doesn't have its clause
-    /// keywords consumed as type-variable applications.
-    stop_type_at_migrate_clauses: bool,
     /// When true, the cross-newline type-application continuation stops at a
     /// `Lower` token on the following line. Set while parsing the `name : Type`
     /// signature line of a record VALUE literal, where a lowercase identifier
@@ -119,7 +114,6 @@ impl Parser {
             context: Vec::new(),
             stop_type_at_headers: false,
             stop_type_app_at_route_entry: false,
-            stop_type_at_migrate_clauses: false,
             record_value_sig_type: false,
             in_case_arm_pat: false,
             no_newline_app: false,
@@ -663,7 +657,6 @@ impl Parser {
             | TokenKind::Atomic
             | TokenKind::With
             | TokenKind::Serve
-            | TokenKind::Migrate
             | TokenKind::Refine
             | TokenKind::Forall => {
                 let kw = format!("{:?}", self.peek()).to_lowercase();
@@ -914,14 +907,6 @@ impl Parser {
     /// expression (`M / S^2`). Used after `Float`/`Int` to decide whether to
     /// parse a postfix unit argument.
     fn can_start_unit_type_arg(&self) -> bool {
-        // Don't consume a unit arg when the next token is a migrate clause
-        // keyword (`to`/`using`) — `migrate *r from Int to Float ...` must
-        // not parse `Int to` as `Int` with unit `to`.
-        if self.stop_type_at_migrate_clauses
-            && matches!(self.peek(), TokenKind::Lower(s) if s == "to" || s == "using")
-        {
-            return false;
-        }
         match self.peek() {
             TokenKind::Upper(_) | TokenKind::Lower(_) | TokenKind::LParen => true,
             TokenKind::Underscore => true,
@@ -1869,7 +1854,6 @@ impl Parser {
             TokenKind::Lower(n) => {
                 n != "yield"
                     && !(self.stop_type_at_headers && (n == "headers" || n == "rateLimit"))
-                    && !(self.stop_type_at_migrate_clauses && (n == "to" || n == "using"))
             }
             TokenKind::StarIdent(_) => {
                 // `*name` is a single source-reference token — always a valid
@@ -2582,7 +2566,7 @@ impl Parser {
                     let ty = ty.unwrap();
                     if matches!(self.peek(), TokenKind::StarIdent(_)) {
                         // Type-first source declaration: `Rel T  *name` (with an
-                        // optional `migrate to … using …` clause). The source IS
+                        // optional migration clause — a bare lambda below it). The source IS
                         // the declaration — emit a SourceDecl field directly. This
                         // is the only source-declaration form; there is no
                         // `*name : Rel T` colon form.
@@ -2601,7 +2585,7 @@ impl Parser {
                                 self.error_at(
                                     m.span,
                                     format!(
-                                        "source '*{}' has more than one pending `migrate` clause",
+                                        "source '*{}' has more than one pending migration clause",
                                         bare
                                     ),
                                 );
@@ -2939,53 +2923,34 @@ impl Parser {
         Some(crate::ast::ConstructorDef { name, fields })
     }
 
-    /// Parse an optional `migrate to U using f` clause hanging off a
-    /// record-embedded source field. Returns `None` when the next token is not
-    /// `migrate`. The pre-migration schema is not named — it is derived from
-    /// the schema lock's last recorded schema for the source.
+    /// Parse an optional migration clause hanging off a record-embedded source
+    /// field: a bare lambda `\old -> <new row>` directly under the `Rel` decl.
+    /// Returns `None` when the next token is not a `\`. The pre-migration
+    /// schema is not named — it is derived from the schema lock's last recorded
+    /// schema for the source; the target is the source's own declared type.
+    ///
+    /// The lambda is an unambiguous lookahead here: the field-loop's next
+    /// declaration always opens with a type-starter (`Upper`, `{`, `<`, `(`,
+    /// `forall`, `_`) or a lowercase value-binding name — never a `\`. A lambda
+    /// only ever appears as a declaration's *value* (after its name), so a `\`
+    /// at the head of the field loop can only be a migration clause on the
+    /// source just declared.
     fn parse_source_field_migration(&mut self) -> Option<crate::ast::SourceMigration> {
         self.skip_newlines();
-        if !self.at(&TokenKind::Migrate) {
+        if !self.at(&TokenKind::Backslash) {
             return None;
         }
-        let migrate_start = self.span().start;
-        self.advance(); // consume `migrate`
-        self.skip_newlines(); // allow `migrate\n  to …` multi-line clauses
-
         let prev_block_indent = self.block_indent;
         self.block_indent = self.cur_column();
-
-        // `migrate from _ using <fn>` — the old schema is the lock's recorded
-        // one (not named in source; `_` marks where it plugs in), and the
-        // target is the source's own declared type, so no `to` annotation.
-        if !matches!(self.peek(), TokenKind::Lower(s) if s == "from") {
-            self.error("expected 'from' in source migration");
-            self.block_indent = prev_block_indent;
-            return None;
-        }
-        self.advance();
-        self.skip_newlines();
-        if !matches!(self.peek(), TokenKind::Underscore) {
-            self.error("expected '_' in source migration (the old schema is derived from the schema lock)");
-            self.block_indent = prev_block_indent;
-            return None;
-        }
-        self.advance();
-
-        self.skip_newlines();
-        if !matches!(self.peek(), TokenKind::Lower(s) if s == "using") {
-            self.error("expected 'using' in source migration");
-            self.block_indent = prev_block_indent;
-            return None;
-        }
-        self.advance();
-        // Keep `block_indent` at the migrate-clause column while parsing
-        // `using_fn` so a following record field at the outer indent terminates
-        // the using-fn's record literal via `at_layout_boundary` instead of
-        // being absorbed as one of its fields. Restore after.
-        let using_fn = self.parse_expr()?;
+        // Keep `block_indent` at the lambda's column while parsing it so a
+        // following record field at the outer indent terminates the lambda's
+        // record literal via `at_layout_boundary` instead of being absorbed as
+        // one of its fields. Restore after.
+        let using_fn = self.parse_lambda()?;
         self.block_indent = prev_block_indent;
-        let span = crate::ast::Span::new(migrate_start, using_fn.span.end);
+        // The clause IS the lambda; `knot lock` excises exactly this range to
+        // strip the migration from the source.
+        let span = using_fn.span;
         Some(crate::ast::SourceMigration { using_fn, span })
     }
 
@@ -4281,11 +4246,6 @@ impl Parser {
     fn can_start_type_atom(&self) -> bool {
         if self.stop_type_at_headers
             && matches!(self.peek(), TokenKind::Lower(s) if s == "headers" || s == "rateLimit")
-        {
-            return false;
-        }
-        if self.stop_type_at_migrate_clauses
-            && matches!(self.peek(), TokenKind::Lower(s) if s == "to" || s == "using")
         {
             return false;
         }

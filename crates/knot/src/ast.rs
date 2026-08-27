@@ -306,7 +306,8 @@ pub enum ExprKind {
         name: Name,
         ty: Type,
         /// The pending migration attached to the source:
-        /// `*todos : [Todo] migrate to B using f`. At most one is staged at a
+        /// `*todos : [Todo]` followed by a bare-lambda migration clause.
+        /// At most one is staged at a
         /// time (rewritten until `knot lock` promotes it into the schema lock);
         /// its pre-migration schema is derived from the lock, not named here.
         migrations: Vec<SourceMigration>,
@@ -742,16 +743,17 @@ pub struct RecordField {
     pub doc: Option<String>,
 }
 
-/// A migration attached to a record-embedded source field:
-/// `*todos : [Todo] migrate from _ using f`. The pre-migration schema (`from _`)
-/// is not named — it is derived from the last schema recorded in the schema
-/// lock. The target schema is the source's own declared type.
+/// A migration attached to a record-embedded source field: a bare lambda
+/// `\old -> <new row>` directly under the `Rel T *name` declaration. The
+/// pre-migration schema is not named — it is derived from the last schema
+/// recorded in the schema lock. The target schema is the source's own declared
+/// type.
 #[derive(Debug, Clone)]
 pub struct SourceMigration {
+    /// The row-mapping lambda (`Old -> New`).
     pub using_fn: Expr,
-    /// Span covering the whole `migrate from _ using …` clause (from the
-    /// `migrate` keyword to the end of `using_fn`). `knot lock` excises this
-    /// exact range to strip the clause from the source.
+    /// Span covering the lambda (from the `\` to the end of its body).
+    /// `knot lock` excises this exact range to strip the clause from the source.
     pub span: Span,
 }
 

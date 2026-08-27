@@ -199,7 +199,7 @@ pub fn check(source_path: &Path, program: &Expr, type_env: &TypeEnv) -> Vec<Diag
                             .note(format!("lock:   {}", old_schema))
                             .note(format!("source: {}", new_schema))
                             .note(format!(
-                                "add: migrate *{} to {{...}} using (\\old -> ...)",
+                                "add a migration clause under the `*{}` source:\n  \\old -> {{...}}",
                                 name
                             )),
                         );

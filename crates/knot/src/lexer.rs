@@ -21,7 +21,6 @@ pub enum TokenKind {
 
     // Keywords
     Serve,
-    Migrate,
     Where,
     Do,
     Match,
@@ -106,7 +105,6 @@ impl TokenKind {
             TokenKind::Lower(_) => "identifier",
             TokenKind::Upper(_) => "type name",
             TokenKind::Serve => "'serve'",
-            TokenKind::Migrate => "'migrate'",
             TokenKind::Where => "'where'",
             TokenKind::Do => "'do'",
             TokenKind::Match => "'match'",
@@ -165,7 +163,6 @@ impl TokenKind {
     pub fn keyword_str(&self) -> Option<&'static str> {
         match self {
             TokenKind::Serve => Some("serve"),
-            TokenKind::Migrate => Some("migrate"),
             TokenKind::Where => Some("where"),
             TokenKind::Do => Some("do"),
             TokenKind::Match => Some("match"),
@@ -557,7 +554,6 @@ impl<'src> Lexer<'src> {
         if first.is_ascii_lowercase() || first == b'_' {
             match text {
                 "serve" => return TokenKind::Serve,
-                "migrate" => return TokenKind::Migrate,
                 "where" => return TokenKind::Where,
                 "do" => return TokenKind::Do,
                 "match" => return TokenKind::Match,

@@ -367,7 +367,7 @@ impl TypeEnv {
                     }
                     for _m in migrations {
                         // The migration's target is the source's own declared
-                        // schema (`migrate from _ using f` carries no `to`).
+                        // schema (the bare-lambda migration clause carries no `to`).
                         // Only the pending target schema is recorded; the
                         // pre-migration schema is derived from the schema lock
                         // (see `lockfile`). One pending migration per source.

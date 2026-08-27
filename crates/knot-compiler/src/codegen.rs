@@ -4438,7 +4438,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
 
             // Apply migrations (before source init). The full chain per source
             // = committed steps (from the schema lock) + the pending step (the
-            // source's staged `migrate to … using …`). Committed `using` fns
+            // source's staged migration clause). Committed `using` fns
             // are stored as source text in the lock and re-parsed here; the
             // pending `using` fn is a live AST expr. A stale database
             // fast-forwards through the whole chain at startup.
@@ -20795,7 +20795,7 @@ fn collect_type_refinements(
 }
 
 /// Collect `(relation, using_fn)` migration sites from record-embedded source
-/// fields (`{ *todos : [Todo] migrate from A to B using f }`). Only the direct
+/// fields (`{ *todos : [Todo] }` with a bare-lambda migration clause). Only the direct
 /// record body is scanned — matching how record-embedded sources are
 /// registered (top-level record-let literals, not arbitrarily nested records).
 fn collect_record_migrations(body: &ast::Expr, out: &mut Vec<(String, ast::Expr)>) {

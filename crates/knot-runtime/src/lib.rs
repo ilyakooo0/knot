@@ -14547,7 +14547,7 @@ pub extern "C-unwind" fn knot_source_init(
             "knot runtime: schema mismatch for source '*{}'.\\n\\
                      Stored:   {}\\n\\
                      Compiled: {}\\n\\
-                     Add a `migrate *{} to {{...}} using (\\old -> ...)` block to your source and run `knot lock`.",
+                     Add a migration clause under the `*{}` source (`\\old -> {{...}}`) and run `knot lock`.",
             name, stored_schema, schema, name
         );
     }

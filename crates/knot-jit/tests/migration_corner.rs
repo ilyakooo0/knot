@@ -554,3 +554,417 @@ Rel V3  *r
     let out = build_and_run(&dir, "mig_chain", committed);
     assert_eq!(out, "\"[{b x  c x  name x}]\"\n{}");
 }
+
+// ── Relation-field add/drop ──────────────────────────────────────────────────
+
+/// Add a relation field where none existed: the transform supplies the new
+/// relation's rows.
+#[test]
+fn corner_add_relation_field() {
+    let dir = dir_for("mig_add_rel");
+    let v1 = r#"with {
+V1  {name Text}
+Rel V1  *people
+}
+(do
+  full *people = [{name "a"}]
+  yield {})"#;
+    let v2 = r#"with {
+V1  {name Text}
+V2  {name Text  tags (Rel Text)}
+Rel V2  *people
+  \p -> {name p.name  tags ["new"]}
+}
+(do
+  yield {})"#;
+    let committed = r#"with {
+V1  {name Text}
+V2  {name Text  tags (Rel Text)}
+Rel V2  *people
+}
+(do
+  rows <- *people
+  base.println (base.show rows)
+  yield {})"#;
+    let out = lifecycle(&dir, "mig_add_rel", v1, v2, committed);
+    assert_eq!(out, "\"[{name a  tags [new]}]\"\n{}");
+}
+
+/// Drop a relation field; the scalar survivors are intact and the child tables
+/// are gone (the read shows only the remaining field).
+#[test]
+fn corner_drop_relation_field() {
+    let dir = dir_for("mig_drop_rel");
+    let v1 = r#"with {
+V1  {name Text  tags (Rel Text)}
+Rel V1  *people
+}
+(do
+  full *people = [{name "a"  tags ["x"]}]
+  yield {})"#;
+    let v2 = r#"with {
+V1  {name Text  tags (Rel Text)}
+V2  {name Text}
+Rel V2  *people
+  \p -> {name p.name}
+}
+(do
+  yield {})"#;
+    let committed = r#"with {
+V1  {name Text  tags (Rel Text)}
+V2  {name Text}
+Rel V2  *people
+}
+(do
+  rows <- *people
+  base.println (base.show rows)
+  yield {})"#;
+    let out = lifecycle(&dir, "mig_drop_rel", v1, v2, committed);
+    assert_eq!(out, "\"[{name a}]\"\n{}");
+}
+
+/// Change a relation field's element type (Rel Text -> Rel Int): the transform
+/// supplies fresh rows of the new element type.
+#[test]
+fn corner_change_relation_element_type() {
+    let dir = dir_for("mig_rel_elem");
+    let v1 = r#"with {
+V1  {name Text  tags (Rel Text)}
+Rel V1  *people
+}
+(do
+  full *people = [{name "a"  tags ["x"]}]
+  yield {})"#;
+    let v2 = r#"with {
+V1  {name Text  tags (Rel Text)}
+V2  {name Text  nums (Rel (Int 1))}
+Rel V2  *people
+  \p -> {name p.name  nums [1  2]}
+}
+(do
+  yield {})"#;
+    let committed = r#"with {
+V1  {name Text  tags (Rel Text)}
+V2  {name Text  nums (Rel (Int 1))}
+Rel V2  *people
+}
+(do
+  rows <- *people
+  base.println (base.show rows)
+  yield {})"#;
+    let out = lifecycle(&dir, "mig_rel_elem", v1, v2, committed);
+    assert_eq!(out, "\"[{name a  nums [1, 2]}]\"\n{}");
+}
+
+// ── Multi-source programs ────────────────────────────────────────────────────
+
+/// Two sources in one program; only one migrates. The other is untouched.
+#[test]
+fn corner_unrelated_source_untouched() {
+    let dir = dir_for("mig_two_src");
+    let v1 = r#"with {
+V1  {name Text}
+Rel V1  *people
+W  {id (Int 1)}
+Rel W  *widgets
+}
+(do
+  full *people = [{name "a"}]
+  full *widgets = [{id 1}]
+  yield {})"#;
+    let v2 = r#"with {
+V1  {name Text}
+V2  {name Text  extra (Int 1)}
+Rel V2  *people
+  \p -> {name p.name  extra 0}
+W  {id (Int 1)}
+Rel W  *widgets
+}
+(do
+  yield {})"#;
+    let committed = r#"with {
+V1  {name Text}
+V2  {name Text  extra (Int 1)}
+Rel V2  *people
+W  {id (Int 1)}
+Rel W  *widgets
+}
+(do
+  p <- *people
+  w <- *widgets
+  base.println (base.show p)
+  base.println (base.show w)
+  yield {})"#;
+    let out = lifecycle(&dir, "mig_two_src", v1, v2, committed);
+    // The migrated source has the new field; the untouched source is intact.
+    assert_eq!(out, "\"[{extra 0  name a}]\"\n\"[{id 1}]\"\n{}");
+}
+
+/// Drop a source entirely (one of two removed); the survivor is intact.
+#[test]
+fn corner_drop_source() {
+    let dir = dir_for("mig_drop_src");
+    let v1 = r#"with {
+V1  {name Text}
+Rel V1  *people
+W  {id (Int 1)}
+Rel W  *widgets
+}
+(do
+  full *people = [{name "a"}]
+  full *widgets = [{id 1}]
+  yield {})"#;
+    let v2 = r#"with {
+V1  {name Text}
+Rel V1  *people
+}
+(do
+  yield {})"#;
+    let committed = r#"with {
+V1  {name Text}
+Rel V1  *people
+}
+(do
+  rows <- *people
+  base.println (base.show rows)
+  yield {})"#;
+    let out = lifecycle(&dir, "mig_drop_src", v1, v2, committed);
+    assert_eq!(out, "\"[{name a}]\"\n{}");
+}
+
+// ── Type-shape transitions ───────────────────────────────────────────────────
+
+/// A tag-enum (all-nullary ADT) field survives a migration.
+#[test]
+fn corner_tag_enum_field() {
+    let dir = dir_for("mig_tag_enum");
+    let v1 = r#"with {
+Color  Red {}  Green {}
+V1  {name Text  col Color}
+Rel V1  *es
+}
+(do
+  full *es = [{name "a"  col (Color.Red {})}]
+  yield {})"#;
+    let v2 = r#"with {
+Color  Red {}  Green {}
+V1  {name Text  col Color}
+V2  {name Text  col Color  extra (Int 1)}
+Rel V2  *es
+  \p -> {name p.name  col p.col  extra 0}
+}
+(do
+  yield {})"#;
+    let committed = r#"with {
+Color  Red {}  Green {}
+V1  {name Text  col Color}
+V2  {name Text  col Color  extra (Int 1)}
+Rel V2  *es
+}
+(do
+  rows <- *es
+  base.println (base.show rows)
+  yield {})"#;
+    let out = lifecycle(&dir, "mig_tag_enum", v1, v2, committed);
+    assert_eq!(out, "\"[{col Red  extra 0  name a}]\"\n{}");
+}
+
+/// Retype a scalar field (Text -> Int): the transform produces the new type.
+#[test]
+fn corner_retype_scalar() {
+    let dir = dir_for("mig_retype");
+    let v1 = r#"with {
+V1  {name Text}
+Rel V1  *people
+}
+(do
+  full *people = [{name "a"}]
+  yield {})"#;
+    let v2 = r#"with {
+V1  {name Text}
+V2  {name (Int 1)}
+Rel V2  *people
+  \p -> {name 42}
+}
+(do
+  yield {})"#;
+    let committed = r#"with {
+V1  {name Text}
+V2  {name (Int 1)}
+Rel V2  *people
+}
+(do
+  rows <- *people
+  base.println (base.show rows)
+  yield {})"#;
+    let out = lifecycle(&dir, "mig_retype", v1, v2, committed);
+    assert_eq!(out, "\"[{name 42}]\"\n{}");
+}
+
+/// The transform computes a fresh payload-ADT value from an old scalar field.
+#[test]
+fn corner_transform_to_payload_adt() {
+    let dir = dir_for("mig_to_adt");
+    let v1 = r#"with {
+V1  {n (Int 1)}
+Rel V1  *r
+}
+(do
+  full *r = [{n 5}]
+  yield {})"#;
+    let v2 = r#"with {
+Shape  Circle {radius (Int 1)}  Point {}
+V1  {n (Int 1)}
+V2  {sh Shape}
+Rel V2  *r
+  \p -> {sh (Shape.Circle {radius p.n})}
+}
+(do
+  yield {})"#;
+    let committed = r#"with {
+Shape  Circle {radius (Int 1)}  Point {}
+V1  {n (Int 1)}
+V2  {sh Shape}
+Rel V2  *r
+}
+(do
+  rows <- *r
+  base.println (base.show rows)
+  yield {})"#;
+    let out = lifecycle(&dir, "mig_to_adt", v1, v2, committed);
+    assert_eq!(out, "\"[{sh Circle {radius 5}}]\"\n{}");
+}
+
+// ── Constraints ─────────────────────────────────────────────────────────────
+
+/// A source carrying a uniqueness constraint migrates; the constraint index
+/// survives and the data is intact.
+#[test]
+fn corner_migration_with_unique_constraint() {
+    let dir = dir_for("mig_uniq");
+    let v1 = r#"with {
+V1  {name Text}
+Rel V1  *people
+*people <= *people.name
+}
+(do
+  full *people = [{name "a"}]
+  yield {})"#;
+    let v2 = r#"with {
+V1  {name Text}
+V2  {name Text  extra (Int 1)}
+Rel V2  *people
+  \p -> {name p.name  extra 0}
+*people <= *people.name
+}
+(do
+  yield {})"#;
+    let committed = r#"with {
+V1  {name Text}
+V2  {name Text  extra (Int 1)}
+Rel V2  *people
+*people <= *people.name
+}
+(do
+  rows <- *people
+  base.println (base.show rows)
+  yield {})"#;
+    let out = lifecycle(&dir, "mig_uniq", v1, v2, committed);
+    assert_eq!(out, "\"[{extra 0  name a}]\"\n{}");
+}
+
+// ── Reverts ─────────────────────────────────────────────────────────────────
+
+/// A revert chain A→B→A with data: the field is added then dropped, and the
+/// surviving data reads back through both transforms.
+#[test]
+fn corner_revert_chain_with_data() {
+    let dir = dir_for("mig_revert_data");
+    let v1 = r#"with {
+V1  {name Text}
+Rel V1  *people
+}
+(do
+  full *people = [{name "a"}]
+  yield {})"#;
+    let v2 = r#"with {
+V1  {name Text}
+V2  {name Text  extra (Int 1)}
+Rel V2  *people
+  \p -> {name p.name  extra 1}
+}
+(do
+  yield {})"#;
+    let v1_revert = r#"with {
+V1  {name Text}
+V2  {name Text  extra (Int 1)}
+Rel V1  *people
+  \p -> {name p.name}
+}
+(do
+  yield {})"#;
+    let committed = r#"with {
+V1  {name Text}
+V2  {name Text  extra (Int 1)}
+Rel V1  *people
+}
+(do
+  rows <- *people
+  base.println (base.show rows)
+  yield {})"#;
+
+    build_and_run(&dir, "mig_revert_data", v1);
+    lock_in_dir(dir.path(), "mig_revert_data");
+    build_and_run(&dir, "mig_revert_data", v2);
+    lock_in_dir(dir.path(), "mig_revert_data");
+    build_and_run(&dir, "mig_revert_data", v1_revert);
+    lock_in_dir(dir.path(), "mig_revert_data");
+    let out = build_and_run(&dir, "mig_revert_data", committed);
+    assert_eq!(out, "\"[{name a}]\"\n{}");
+}
+
+// ── Error cases ─────────────────────────────────────────────────────────────
+
+/// A migration clause on an UNCHANGED schema is rejected: there's nothing to
+/// migrate, so the clause is meaningless. This pins the "no-op migration"
+/// guard.
+#[test]
+fn corner_migration_clause_on_unchanged_schema_is_an_error() {
+    let dir = dir_for("mig_noop");
+    let v1 = r#"with {
+V1  {name Text}
+Rel V1  *people
+}
+(do
+  full *people = [{name "a"}]
+  yield {})"#;
+    build_and_run(&dir, "mig_noop", v1);
+    lock_in_dir(dir.path(), "mig_noop");
+
+    // Same schema, but a migration clause is attached — no schema change to
+    // justify it.
+    let noop = r#"with {
+V1  {name Text}
+Rel V1  *people
+  \p -> {name p.name}
+}
+(do
+  yield {})"#;
+    std::fs::write(dir.join("mig_noop.knot"), noop).unwrap();
+    let build = std::process::Command::new(knot_bin())
+        .arg("build")
+        .arg(dir.join("mig_noop.knot"))
+        .arg("-o")
+        .arg(dir.join("mig_noop"))
+        .output()
+        .expect("knot build");
+    assert!(
+        !build.status.success(),
+        "a migration clause on an unchanged schema must fail the build"
+    );
+    let stderr = String::from_utf8_lossy(&build.stderr);
+    assert!(
+        stderr.contains("schema is unchanged"),
+        "error names the unchanged-schema guard: {stderr}"
+    );
+}

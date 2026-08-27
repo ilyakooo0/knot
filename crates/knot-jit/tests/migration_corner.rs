@@ -968,3 +968,288 @@ Rel V1  *people
         "error names the unchanged-schema guard: {stderr}"
     );
 }
+
+// ── Optional & scalar types ──────────────────────────────────────────────────
+
+/// A `Maybe` field survives a migration — both `Just` and `Nothing` rows.
+#[test]
+fn corner_maybe_field() {
+    let dir = dir_for("mig_maybe");
+    let v1 = r#"with {
+V1  {name Text  nick (Maybe Text)}
+Rel V1  *people
+}
+(do
+  full *people = [{name "a"  nick (Maybe.Just {value "al"})}  {name "b"  nick (Maybe.Nothing {})}]
+  yield {})"#;
+    let v2 = r#"with {
+V1  {name Text  nick (Maybe Text)}
+V2  {name Text  nick (Maybe Text)  extra (Int 1)}
+Rel V2  *people
+  \p -> {name p.name  nick p.nick  extra 0}
+}
+(do
+  yield {})"#;
+    let committed = r#"with {
+V1  {name Text  nick (Maybe Text)}
+V2  {name Text  nick (Maybe Text)  extra (Int 1)}
+Rel V2  *people
+}
+(do
+  rows <- *people
+  base.println (base.show rows)
+  yield {})"#;
+    let out = lifecycle(&dir, "mig_maybe", v1, v2, committed);
+    assert_eq!(
+        out,
+        "\"[{extra 0  name a  nick Just {value al}}, {extra 0  name b  nick Nothing}]\"\n{}"
+    );
+}
+
+/// A `Float` field survives a migration.
+#[test]
+fn corner_float_field() {
+    let dir = dir_for("mig_float");
+    let v1 = r#"with {
+V1  {name Text  score (Float 1)}
+Rel V1  *r
+}
+(do
+  full *r = [{name "a"  score 1.5}]
+  yield {})"#;
+    let v2 = r#"with {
+V1  {name Text  score (Float 1)}
+V2  {name Text  score (Float 1)  extra (Int 1)}
+Rel V2  *r
+  \p -> {name p.name  score p.score  extra 0}
+}
+(do
+  yield {})"#;
+    let committed = r#"with {
+V1  {name Text  score (Float 1)}
+V2  {name Text  score (Float 1)  extra (Int 1)}
+Rel V2  *r
+}
+(do
+  rows <- *r
+  base.println (base.show rows)
+  yield {})"#;
+    let out = lifecycle(&dir, "mig_float", v1, v2, committed);
+    assert_eq!(out, "\"[{extra 0  name a  score 1.5}]\"\n{}");
+}
+
+// ── Deep nesting ─────────────────────────────────────────────────────────────
+
+/// A record field containing a relation of payload-ADTs — the deepest nesting
+/// (record -> relation -> ADT child tables) — survives a migration.
+#[test]
+fn corner_deeply_nested() {
+    let dir = dir_for("mig_deep");
+    let v1 = r#"with {
+Shape  Circle {radius (Int 1)}  Point {}
+Inner  {shapes (Rel Shape)}
+V1  {name Text  inner Inner}
+Rel V1  *r
+}
+(do
+  full *r = [{name "a"  inner {shapes [(Shape.Point {})]}}]
+  yield {})"#;
+    let v2 = r#"with {
+Shape  Circle {radius (Int 1)}  Point {}
+Inner  {shapes (Rel Shape)}
+V1  {name Text  inner Inner}
+V2  {name Text  inner Inner  extra (Int 1)}
+Rel V2  *r
+  \p -> {name p.name  inner p.inner  extra 0}
+}
+(do
+  yield {})"#;
+    let committed = r#"with {
+Shape  Circle {radius (Int 1)}  Point {}
+Inner  {shapes (Rel Shape)}
+V1  {name Text  inner Inner}
+V2  {name Text  inner Inner  extra (Int 1)}
+Rel V2  *r
+}
+(do
+  rows <- *r
+  base.println (base.show rows)
+  yield {})"#;
+    let out = lifecycle(&dir, "mig_deep", v1, v2, committed);
+    assert_eq!(out, "\"[{extra 0  inner {shapes [Point]}  name a}]\"\n{}");
+}
+
+// ── Transform reads ──────────────────────────────────────────────────────────
+
+/// The transform reads a nested record field's subfield into a top-level column.
+#[test]
+fn corner_transform_reads_nested_subfield() {
+    let dir = dir_for("mig_read_nested");
+    let v1 = r#"with {
+Addr  {city Text  zip (Int 1)}
+V1  {name Text  addr Addr}
+Rel V1  *people
+}
+(do
+  full *people = [{name "a"  addr {city "x"  zip 100}}]
+  yield {})"#;
+    let v2 = r#"with {
+Addr  {city Text  zip (Int 1)}
+V1  {name Text  addr Addr}
+V2  {name Text  zip (Int 1)}
+Rel V2  *people
+  \p -> {name p.name  zip p.addr.zip}
+}
+(do
+  yield {})"#;
+    let committed = r#"with {
+Addr  {city Text  zip (Int 1)}
+V1  {name Text  addr Addr}
+V2  {name Text  zip (Int 1)}
+Rel V2  *people
+}
+(do
+  rows <- *people
+  base.println (base.show rows)
+  yield {})"#;
+    let out = lifecycle(&dir, "mig_read_nested", v1, v2, committed);
+    assert_eq!(out, "\"[{name a  zip 100}]\"\n{}");
+}
+
+/// Rename AND retype a field in one migration.
+#[test]
+fn corner_rename_and_retype() {
+    let dir = dir_for("mig_rename_retype");
+    let v1 = r#"with {
+V1  {old Text}
+Rel V1  *r
+}
+(do
+  full *r = [{old "x"}]
+  yield {})"#;
+    let v2 = r#"with {
+V1  {old Text}
+V2  {new (Int 1)}
+Rel V2  *r
+  \p -> {new 1}
+}
+(do
+  yield {})"#;
+    let committed = r#"with {
+V1  {old Text}
+V2  {new (Int 1)}
+Rel V2  *r
+}
+(do
+  rows <- *r
+  base.println (base.show rows)
+  yield {})"#;
+    let out = lifecycle(&dir, "mig_rename_retype", v1, v2, committed);
+    assert_eq!(out, "\"[{new 1}]\"\n{}");
+}
+
+// ── Constraints ─────────────────────────────────────────────────────────────
+
+/// A source with a referential (subset) constraint migrates; the constraint
+/// triggers survive the table swap and the data is intact. (Regression: the
+/// swap fired a trigger against the absent table and aborted.)
+#[test]
+fn corner_migration_with_subset_constraint() {
+    let dir = dir_for("mig_subset");
+    let v1 = r#"with {
+Owner  {email Text}
+Rel Owner  *owners
+V1  {email Text}
+Rel V1  *pets
+*pets.email <= *owners.email
+}
+(do
+  full *owners = [{email "a@x"}]
+  full *pets = [{email "a@x"}]
+  yield {})"#;
+    let v2 = r#"with {
+Owner  {email Text}
+Rel Owner  *owners
+V1  {email Text}
+V2  {email Text  extra (Int 1)}
+Rel V2  *pets
+  \p -> {email p.email  extra 0}
+*pets.email <= *owners.email
+}
+(do
+  yield {})"#;
+    let committed = r#"with {
+Owner  {email Text}
+Rel Owner  *owners
+V1  {email Text}
+V2  {email Text  extra (Int 1)}
+Rel V2  *pets
+*pets.email <= *owners.email
+}
+(do
+  rows <- *pets
+  base.println (base.show rows)
+  yield {})"#;
+    let out = lifecycle(&dir, "mig_subset", v1, v2, committed);
+    assert_eq!(out, "\"[{email a@x  extra 0}]\"\n{}");
+}
+
+/// After migrating a subset-constrained source, the constraint still bites: a
+/// new row referencing a missing superset key is rejected.
+#[test]
+fn corner_subset_constraint_still_enforced_after_migration() {
+    let dir = dir_for("mig_subset_enforced");
+    let v1 = r#"with {
+Owner  {email Text}
+Rel Owner  *owners
+V1  {email Text}
+Rel V1  *pets
+*pets.email <= *owners.email
+}
+(do
+  full *owners = [{email "a@x"}]
+  full *pets = [{email "a@x"}]
+  yield {})"#;
+    let v2 = r#"with {
+Owner  {email Text}
+Rel Owner  *owners
+V1  {email Text}
+V2  {email Text  extra (Int 1)}
+Rel V2  *pets
+  \p -> {email p.email  extra 0}
+*pets.email <= *owners.email
+}
+(do
+  yield {})"#;
+    // Migrate + commit.
+    build_and_run(&dir, "mig_subset_enforced", v1);
+    lock_in_dir(dir.path(), "mig_subset_enforced");
+    build_and_run(&dir, "mig_subset_enforced", v2);
+    lock_in_dir(dir.path(), "mig_subset_enforced");
+
+    // Now insert a pet referencing a nonexistent owner — the constraint must
+    // still fire after the migration.
+    let bad_insert = r#"with {
+Owner  {email Text}
+Rel Owner  *owners
+V1  {email Text}
+V2  {email Text  extra (Int 1)}
+Rel V2  *pets
+*pets.email <= *owners.email
+}
+(do
+  pets <- *pets
+  *pets = base.union pets [{email "missing@x"  extra 0}]
+  yield {})"#;
+    std::fs::write(dir.join("mig_subset_enforced.knot"), bad_insert).unwrap();
+    build_in_dir("mig_subset_enforced", bad_insert, dir.path());
+    let run = std::process::Command::new(dir.join("mig_subset_enforced"))
+        .current_dir(dir.path())
+        .output()
+        .expect("run");
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        !run.status.success() && stderr.contains("subset constraint violated"),
+        "the subset constraint still fires after migration: {stderr}"
+    );
+}

@@ -15985,14 +15985,14 @@ impl<M: cranelift_module::Module> Codegen<M> {
         // Float comparisons must stay in memory: Knot compares floats with
         // total_cmp (-0.0 < +0.0, NaN orderable) while SQL says -0.0 = 0.0
         // and stores NaN as NULL — `col != ?` would silently drop NaN rows.
-        if col_ty.as_deref() == Some("float") {
+        if col_ty.as_deref() == Some("Float") {
             return None;
         }
         // Equality on all-nullary ("tag") ADT columns stays pushable (tag
         // equality is name equality), but ordered comparisons would use
         // byte-wise name order, ignoring the type's Ord (declaration order
         // or a user impl) — keep those in memory.
-        if col_ty.as_deref() == Some("tag") && matches!(op, "<" | ">" | "<=" | ">=") {
+        if col_ty.as_deref() == Some("Tag") && matches!(op, "<" | ">" | "<=" | ">=") {
             return None;
         }
 

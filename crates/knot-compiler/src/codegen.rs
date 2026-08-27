@@ -15726,6 +15726,20 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     params: inner.params,
                 })
             }
+            // Match-on-a-payload-ADT-field idiom:
+            //   match (e.sh)  Circle {radius r}  ->  r > 5   _  ->  False
+            // The field's value lives in a content-addressed child table keyed
+            // by `_hash`, with `_tag` marking the constructor and the payload
+            // fields as real columns. Push it down as a correlated EXISTS:
+            //   EXISTS (SELECT 1 FROM "_knot_<src>__/sh" c
+            //           WHERE c."_hash" = <outer>."sh"
+            //             AND c."_tag" = 'Circle' AND c."radius" > 5)
+            // Recognized only when exactly one arm binds a record payload and
+            // returns a payload-field-vs-constant comparison, and every other
+            // arm returns False — otherwise bail to in-memory.
+            ast::ExprKind::Case { scrutinee, arms } => {
+                self.try_compile_match_payload_pred(bind_var, scrutinee, arms, schema)
+            }
             // `not expr` function application form → NOT (...)
             // `contains needle haystack` → INSTR(haystack, needle) > 0
             ast::ExprKind::App { func, arg } => {
@@ -15949,6 +15963,186 @@ impl<M: cranelift_module::Module> Codegen<M> {
             }
             _ => None,
         }
+    }
+
+    /// Push down the match-on-a-payload-ADT-field idiom:
+    ///   `match (e.sh)  Circle {radius r}  ->  r > 5   _  ->  False`
+    /// Payload-ADT fields are content-addressed into a child table
+    /// (`_knot_<src>__/<field>`, keyed by `_hash`, `_tag` marking the
+    /// constructor, payload fields as columns), and the parent holds the
+    /// value's hash in its `<field>` BLOB column. So the predicate becomes a
+    /// correlated EXISTS against that child table — no FROM-clause change.
+    ///
+    /// Recognized only when the scrutinee is `<bv>.<field>` for a payload-ADT
+    /// field, exactly one arm binds a record payload and returns a
+    /// payload-field-vs-constant comparison, and every other arm rejects
+    /// (returns False). Anything else returns None → in-memory fallback.
+    fn try_compile_match_payload_pred(
+        &self,
+        bind_var: &str,
+        scrutinee: &ast::Expr,
+        arms: &[ast::CaseArm],
+        schema: &str,
+    ) -> Option<SqlFragment> {
+        // Scrutinee must be `<bv>.<field>`.
+        let adt_field = match &scrutinee.node {
+            ast::ExprKind::FieldAccess { expr, field } => match &expr.node {
+                ast::ExprKind::Var(v) if v.as_str() == bind_var => field.clone(),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        // The field must be a payload-ADT: its descriptor is `(Ctor{..} | ...)`.
+        let field_desc = lookup_col_type_from_schema(schema, &adt_field)?;
+        let fd = field_desc.trim();
+        if std::env::var("KNOT_DEBUG_MATCH").is_ok() {
+            eprintln!("[match-pred] field={} desc={:?}", adt_field, fd);
+        }
+        if !(fd.starts_with('(') && fd.ends_with(')') && fd.contains('{')) {
+            if std::env::var("KNOT_DEBUG_MATCH").is_ok() {
+                eprintln!("[match-pred] BAIL: not payload-ADT");
+            }
+            return None;
+        }
+
+        // Find the one arm that binds a record payload `Ctor {f x}` and returns
+        // a comparison `x <op> const` (or `const <op> x`). All other arms must
+        // reject (return False). More than one payload-binding arm → ambiguous
+        // → bail.
+        let mut found: Option<(String, String, &'static str, Box<ast::Expr>)> = None; // (ctor, field, sql_op, const)
+        for arm in arms {
+            if std::env::var("KNOT_DEBUG_MATCH").is_ok() {
+                eprintln!("[match-pred] arm pat={:?} body={:?}", arm.pat.node, arm.body.node);
+            }
+            // Does this arm reject (return False)? Recognize `False {}`,
+            // `Bool.False {}` (FieldAccess on the `Bool` constructor), and the
+            // bare `False`/`Bool.False` constructor — applied to a unit record
+            // or not.
+            let is_false_ctor = |e: &ast::Expr| match &e.node {
+                ast::ExprKind::Constructor(c) => c.as_str() == "False",
+                ast::ExprKind::FieldAccess { expr, field } => {
+                    field == "False"
+                        && matches!(&expr.node, ast::ExprKind::Constructor(c) if c.as_str() == "Bool")
+                }
+                _ => false,
+            };
+            let rejects = is_false_ctor(&arm.body)
+                || matches!(&arm.body.node, ast::ExprKind::App { func, arg }
+                    if is_false_ctor(func) && matches!(&arg.node, ast::ExprKind::Record(r) if r.is_empty()));
+            if rejects {
+                continue;
+            }
+            // Otherwise it must be the single payload-binding arm.
+            if found.is_some() {
+                return None;
+            }
+            let ast::PatKind::Constructor { name: ctor, payload, .. } = &arm.pat.node else {
+                return None;
+            };
+            let ast::PatKind::Record(field_pats) = &payload.node else {
+                return None;
+            };
+            // The body is `x <op> const` or `const <op> x`, where x is one of
+            // the bound payload fields.
+            let ast::ExprKind::BinOp { op, lhs, rhs } = &arm.body.node else {
+                return None;
+            };
+            let sql_op = match op {
+                ast::BinOp::Eq => "=",
+                ast::BinOp::Neq => "!=",
+                ast::BinOp::Lt => "<",
+                ast::BinOp::Gt => ">",
+                ast::BinOp::Le => "<=",
+                ast::BinOp::Ge => ">=",
+                _ => return None,
+            };
+            // Which side is the bound payload var?
+            let payload_var = |e: &ast::Expr| -> Option<String> {
+                if let ast::ExprKind::Var(v) = &e.node {
+                    let vs = v.as_str();
+                    if field_pats.iter().any(|fp| {
+                        matches!(&fp.pattern, Some(p) if matches!(&p.node, ast::PatKind::Var(b) if b.as_str() == vs))
+                            || (fp.pattern.is_none() && fp.name.as_str() == vs)
+                    }) {
+                        return Some(vs.to_string());
+                    }
+                }
+                None
+            };
+            let (pvar, const_expr, reversed) = if let Some(pv) = payload_var(lhs) {
+                (pv, rhs.clone(), false)
+            } else if let Some(pv) = payload_var(rhs) {
+                (pv, lhs.clone(), true)
+            } else {
+                return None;
+            };
+            // The constant must be a simple value (literal / outer var).
+            simple_value_param(bind_var, &const_expr)?;
+            // Reverse the operator when the constant is on the left.
+            let final_op = if reversed {
+                match sql_op {
+                    "<" => ">",
+                    ">" => "<",
+                    "<=" => ">=",
+                    ">=" => "<=",
+                    eq => eq, // =, !=
+                }
+            } else {
+                sql_op
+            };
+            // The payload column = the field name that bound `pvar`.
+            let pfield = field_pats
+                .iter()
+                .find(|fp| {
+                    matches!(&fp.pattern, Some(p) if matches!(&p.node, ast::PatKind::Var(b) if b.as_str() == pvar))
+                        || (fp.pattern.is_none() && fp.name.as_str() == pvar)
+                })?
+                .name
+                .as_str()
+                .to_string();
+            found = Some((ctor.as_str().to_string(), pfield, final_op, const_expr));
+        }
+        let (ctor, pfield, cmp_op, const_expr) = found?;
+        if std::env::var("KNOT_DEBUG_MATCH").is_ok() {
+            eprintln!("[match-pred] matched ctor={} pfield={} op={}", ctor, pfield, cmp_op);
+        }
+
+        // The child table name + the parent's outer source name (reverse-lookup
+        // from the schema, as the correlated-EXISTS path does).
+        let outer_src = self
+            .source_schemas
+            .iter()
+            .find(|(_, s)| *s == schema)
+            .map(|(n, _)| n.clone())?;
+        let child_table = format!("_knot_{}__/{}", outer_src, adt_field);
+        let outer_table = format!("_knot_{}", outer_src);
+
+        // Payload-column type gate: floats (NaN/-0.0) and ordered tag
+        // comparisons stay in memory — same rule as the top-level comparison.
+        let col_ty = lookup_col_type_from_schema(&field_desc, &pfield).map(|t| sql_kind(&t));
+        let param = simple_value_param(bind_var, &const_expr)?;
+        // Gate: ordered comparison on a tag payload column stays in memory.
+        if col_ty.as_deref() == Some("tag") && matches!(cmp_op, "<" | ">" | "<=" | ">=") {
+            return None;
+        }
+        if col_ty.as_deref() == Some("float") {
+            return None;
+        }
+        let sql = format!(
+            "EXISTS(SELECT 1 FROM {} WHERE {} = {}.{} AND {} = '{}' AND {} {} ?)",
+            quote_sql_ident(&child_table),
+            quote_sql_ident("_hash"),
+            quote_sql_ident(&outer_table),
+            quote_sql_ident(&adt_field),
+            quote_sql_ident("_tag"),
+            ctor.replace('\'', "''"),
+            quote_sql_ident(&pfield),
+            cmp_op,
+        );
+        Some(SqlFragment {
+            sql,
+            params: vec![param],
+        })
     }
 
     /// Try to compile `field_expr op value_expr` to SQL.

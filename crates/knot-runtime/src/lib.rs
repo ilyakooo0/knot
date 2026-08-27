@@ -15238,7 +15238,7 @@ pub extern "C-unwind" fn knot_source_read_where(
             let col_offset = if has_children { 1 } else { 0 }; // skip _content_hash
 
             for (i, col) in rec.columns.iter().enumerate() {
-                let val = read_sql_column(row, i + col_offset, col.ty);
+                let val = read_field_value(&db_ref.conn, &table_name, row, i + col_offset, col);
                 let cname = col.name.as_bytes();
                 knot_record_set_field(record, cname.as_ptr(), cname.len(), val);
             }
@@ -15300,6 +15300,12 @@ pub extern "C-unwind" fn knot_source_query(
 
     let rec = parse_record_schema(result_schema);
 
+    // The primary source table this query reads from, used to resolve
+    // composite (RecRef/AdtRef) columns to their content-addressed child
+    // tables. Derived from the `FROM "_knot_<name>"` clause; absent for a
+    // multi-table join (where composite reconstruction isn't attempted).
+    let primary_table = extract_primary_source_table(sql);
+
     let mut stmt = db_ref
         .conn
         .prepare_cached(sql)
@@ -15318,13 +15324,44 @@ pub extern "C-unwind" fn knot_source_query(
     {
         let record = knot_record_empty(rec.columns.len());
         for (i, col) in rec.columns.iter().enumerate() {
-            let val = read_sql_column(row, i, col.ty);
+            // Composite columns (payload ADT / nested record) hold a content
+            // hash; reconstruct the value via the child table. Plain columns
+            // use the flat decode.
+            let val = if col.store.is_some()
+                && let Some(table) = &primary_table
+            {
+                read_field_value(&db_ref.conn, table, row, i, col)
+            } else {
+                read_sql_column(row, i, col.ty)
+            };
             let cname = col.name.as_bytes();
             knot_record_set_field(record, cname.as_ptr(), cname.len(), val);
         }
         rows.push(record);
     }
     alloc(Value::Relation(rows))
+}
+
+/// Extract the primary `_knot_<name>` source table from a query's FROM clause.
+/// Returns `None` when there's no single unambiguous source (e.g. a join).
+fn extract_primary_source_table(sql: &str) -> Option<String> {
+    let mut tables = sql
+        .match_indices("FROM")
+        .filter_map(|(i, _)| {
+            let rest = &sql[i + 4..];
+            let rest = rest.trim_start();
+            let rest = rest.strip_prefix('"')?;
+            let end = rest.find('"')?;
+            let name = &rest[..end];
+            // Bare `_knot_<name>` — `read_field_value`/`child_table_name`
+            // re-quote it when building the child table name.
+            name.strip_prefix("_knot_").map(|_| name.to_string())
+        });
+    let first = tables.next()?;
+    // The first FROM is the primary (outermost) source table. Later FROMs are
+    // subqueries (e.g. a correlated EXISTS over a child table) — those belong
+    // to the primary source's own tree, so the first match is the right parent.
+    Some(first)
 }
 
 /// Read rows from a source ADT relation matching a specific constructor tag.

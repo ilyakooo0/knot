@@ -15973,26 +15973,25 @@ impl<M: cranelift_module::Module> Codegen<M> {
             return None;
         };
 
-        let col_ty = lookup_col_type_from_schema(schema, &col_name);
-        // Payload-bearing ADT fields and nested records are stored as JSON
-        // documents, but the runtime encodes the compared Knot value
-        // differently when binding it as a SQL parameter (constructor
-        // params bind as bare tag text). A pushed-down `col = ?` would
-        // silently drop matching rows — fall back to in-memory evaluation.
+        let col_ty = lookup_col_type_from_schema(schema, &col_name).map(|t| sql_kind(&t));
+        // Composite columns (records, payload variants, relations) are stored as
+        // content-addressed child tables whose in-row value is a hash, not the
+        // compared Knot value. A pushed-down `col = ?` would silently drop
+        // matching rows — fall back to in-memory evaluation.
         if col_ty.as_deref() == Some("json") {
             return None;
         }
         // Float comparisons must stay in memory: Knot compares floats with
         // total_cmp (-0.0 < +0.0, NaN orderable) while SQL says -0.0 = 0.0
         // and stores NaN as NULL — `col != ?` would silently drop NaN rows.
-        if col_ty.as_deref() == Some("Float") {
+        if col_ty.as_deref() == Some("float") {
             return None;
         }
         // Equality on all-nullary ("tag") ADT columns stays pushable (tag
         // equality is name equality), but ordered comparisons would use
         // byte-wise name order, ignoring the type's Ord (declaration order
         // or a user impl) — keep those in memory.
-        if col_ty.as_deref() == Some("Tag") && matches!(op, "<" | ">" | "<=" | ">=") {
+        if col_ty.as_deref() == Some("tag") && matches!(op, "<" | ">" | "<=" | ">=") {
             return None;
         }
 
@@ -17888,6 +17887,32 @@ fn rewrite_body_through_projection(
     rewrite(plan, bind_var, body)
 }
 
+/// The SQL-type vocabulary used by pushdown decisions, derived from a descriptor
+/// kind string: scalars lowercased, every composite shape (record `{...}`,
+/// variant `(...)`, relation `(Rel ...)`) → `json` except an all-nullary
+/// variant, which is `tag`. `lookup_col_type_from_schema` returns the descriptor
+/// kind verbatim (cased, structural) because its result is also re-emitted into
+/// result schemas the runtime re-parses; call this only where a pushdown needs
+/// the SQL category, never for descriptor re-emission.
+fn sql_kind(ty: &str) -> String {
+    let t = ty.trim();
+    match t {
+        "Int" | "int" => "int".to_string(),
+        "Float" | "float" => "float".to_string(),
+        "Text" | "text" => "text".to_string(),
+        "Bool" | "bool" => "bool".to_string(),
+        "Bytes" | "bytes" => "bytes".to_string(),
+        "Uuid" | "uuid" => "text".to_string(),
+        _ => {
+            if t.starts_with('(') && t.ends_with(')') && !t.contains('{') {
+                "tag".to_string()
+            } else {
+                "json".to_string()
+            }
+        }
+    }
+}
+
 pub(crate) fn lookup_col_type_from_schema(schema: &str, col_name: &str) -> Option<String> {
     // ADT-relation schemas (`(Ctor{field Kind} | Ctor2 | ...)`) describe a wide
     // table where each constructor's payload fields are columns. The record
@@ -19377,7 +19402,9 @@ pub(crate) fn infer_sql_expr_type(
             if let ast::ExprKind::Var(name) = &inner.node
                 && name == bind_var
             {
-                return lookup_col_type_from_schema(schema, col_name);
+                // Normalize the descriptor kind to the lowercase SQL vocabulary
+                // (literal branches below already produce it).
+                return lookup_col_type_from_schema(schema, col_name).map(|t| sql_kind(&t));
             }
             None
         }

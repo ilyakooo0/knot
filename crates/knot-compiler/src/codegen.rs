@@ -15978,7 +15978,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
         // content-addressed child tables whose in-row value is a hash, not the
         // compared Knot value. A pushed-down `col = ?` would silently drop
         // matching rows — fall back to in-memory evaluation.
-        if col_ty.as_deref() == Some("json") {
+        if col_ty.as_deref() == Some("composite") {
             return None;
         }
         // Float comparisons must stay in memory: Knot compares floats with
@@ -17907,7 +17907,7 @@ fn sql_kind(ty: &str) -> String {
             if t.starts_with('(') && t.ends_with(')') && !t.contains('{') {
                 "tag".to_string()
             } else {
-                "json".to_string()
+                "composite".to_string()
             }
         }
     }
@@ -20425,12 +20425,13 @@ pub(crate) fn sql_scalar_kind(
                     Some("int") => Some(SqlScalarKind::Int),
                     Some("float") => Some(SqlScalarKind::Float),
                     Some("text") => Some(SqlScalarKind::Text),
-                    // Payload-bearing ADT fields and nested records are
-                    // stored as JSON documents, but the runtime binds the
-                    // corresponding Knot values differently (constructor
-                    // params bind as bare tag text) — SQL comparison would
-                    // silently mismatch. Never push down json columns.
-                    Some("json") => return Err(()),
+                    // Composite fields (payload variants, records, relations)
+                    // are stored as content-addressed child tables; the parent
+                    // row holds a hash, but the runtime binds the compared Knot
+                    // value differently (constructor params bind as bare tag
+                    // text) — SQL comparison would silently mismatch. Never
+                    // push down composite columns.
+                    Some("composite") => return Err(()),
                     Some(_) => Some(SqlScalarKind::Other),
                     None => None, // not a column — runtime param
                 })

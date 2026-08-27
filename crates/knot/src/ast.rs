@@ -514,7 +514,10 @@ pub enum TypeKind {
     /// `a -> b` — function type.
     Function { param: Box<Type>, result: Box<Type> },
 
-    /// `<Open {} | InProgress {assignee: Text}>` — inline variant type.
+    /// A named ADT's declaration body — the constructor list after
+    /// `Color  Red {}  Green {}`. Produced only by the data-declaration parser
+    /// (`parse_ctor_def`), never by an inline `(A | B)` type — inline variants
+    /// were removed; a sum type is always named.
     Variant {
         constructors: Vec<ConstructorDef>,
         rest: Option<Name>,

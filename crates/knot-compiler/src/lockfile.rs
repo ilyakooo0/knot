@@ -614,7 +614,11 @@ fn history_entry_src(name: &str, step: &CommittedMigration) -> String {
 
 /// Escape a string for embedding in a knot text literal in the lock.
 fn escape_lock_string(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
+    // Newlines are escaped so a multi-line migration fn (e.g. a `match`) fits a
+    // single-line lock record; the string lexer reads `\n` back as a newline.
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
 }
 
 /// Find the migration fn source of the pending migration on a record-embedded

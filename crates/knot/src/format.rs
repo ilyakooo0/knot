@@ -738,16 +738,22 @@ fn render_expr_inline(e: &Expr, parent: Prec) -> String {
             paren_if(parent > Prec::Unary, s)
         }
         ExprKind::Case { scrutinee, arms } => {
-            let mut s = format!("case {} of", render_expr_inline(scrutinee, Prec::Lowest));
-            // The first arm follows `of` directly; `;` only separates arms.
-            // A leading `;` would make the output unparseable.
-            for (i, arm) in arms.iter().enumerate() {
-                s.push_str(if i == 0 { " " } else { "; " });
+            // knot's match syntax is gap-separated and layout-sensitive:
+            //   match (scrutinee)
+            //     Pat1  body1
+            //     Pat2  body2
+            // There is no single-line form (a gap can't separate one arm's body
+            // from the next arm's pattern unambiguously), so render multi-line.
+            // The lockfile stores this with newlines escaped (\n), which the
+            // string lexer reads back, so the round-trip preserves the layout.
+            let mut s = format!("match ({})", render_expr_inline(scrutinee, Prec::Lowest));
+            for arm in arms {
+                s.push_str("\n  ");
                 s.push_str(&render_pat(&arm.pat));
-                s.push_str(" -> ");
+                s.push_str("  ");
                 s.push_str(&render_expr_inline(&arm.body, Prec::Lowest));
             }
-            // Always parenthesize an inline case: in positions like list
+            // Always parenthesize an inline match: in positions like list
             // elements or record fields the last arm would otherwise swallow
             // the following `,`/`]`/`}` tokens on reparse.
             format!("({})", s)

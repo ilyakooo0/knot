@@ -13468,15 +13468,34 @@ pub extern "C-unwind" fn knot_source_migrate(
 
         // Swap the temp table into place: drop the old table (and any nested
         // child tables) and rename the temp table to the real name.
+        // Child tables come from RelRef fields (element + link) AND from
+        // RecRef/AdtRef columns (a content-addressed child table). Both must be
+        // dropped, or a stale table blocks the migrated child's rename.
         fn drop_nested_tables(
             conn: &rusqlite::Connection,
             parent_table: &str,
+            columns: &[ColumnSpec],
             nested: &[NestedField],
         ) {
+            for col in columns {
+                if matches!(
+                    col.store.as_deref(),
+                    Some(FieldStore::RecRef(_)) | Some(FieldStore::AdtRef(_))
+                ) {
+                    let child = child_table_name(parent_table, &col.name);
+                    // A RecRef child may itself nest.
+                    if let Some(FieldStore::RecRef(rec)) = col.store.as_deref() {
+                        drop_nested_tables(conn, &child, &rec.columns, &rec.nested);
+                    }
+                    let drop_child = format!("DROP TABLE IF EXISTS {};", quote_ident(&child));
+                    debug_sql(&drop_child);
+                    let _ = conn.execute_batch(&drop_child);
+                }
+            }
             for nf in nested {
                 let child = child_table_name(parent_table, &nf.name);
                 // Drop grandchildren first (depth-first)
-                drop_nested_tables(conn, &child, &nf.nested);
+                drop_nested_tables(conn, &child, &nf.columns, &nf.nested);
                 // Drop the element table and its link table — a stale link table
                 // left behind would block the migrated link's rename into place.
                 for t in [&child, &format!("{}__link", child)] {
@@ -13488,7 +13507,7 @@ pub extern "C-unwind" fn knot_source_migrate(
         }
         if !is_adt_schema(old_schema) {
             let old_rec = parse_record_schema(old_schema);
-            drop_nested_tables(&db_ref.conn, &table_name, &old_rec.nested);
+            drop_nested_tables(&db_ref.conn, &table_name, &old_rec.columns, &old_rec.nested);
         }
 
         let drop_sql = format!("DROP TABLE IF EXISTS {};", table);
@@ -13511,35 +13530,62 @@ pub extern "C-unwind" fn knot_source_migrate(
         // read would look at the (dropped) real-named children and find nothing.
         // Depth-first so a nested child's parent exists before it is renamed.
         if !is_adt_schema(new_schema) {
-            fn rename_nested_tables(
+            // A child table exists for every RelRef (element + link) and for
+            // every RecRef/AdtRef column (a content-addressed child table).
+            // Recurse over the whole tree, carrying (columns, nested) since a
+            // NestedField and a RecordSchema both decompose to that pair.
+            fn rename_child_tables(
                 conn: &rusqlite::Connection,
                 tmp_parent: &str,
                 real_parent: &str,
+                columns: &[ColumnSpec],
                 nested: &[NestedField],
             ) {
+                // (tmp child, real child, child columns, child nested)
+                let mut recurse: Vec<(String, String, &[ColumnSpec], &[NestedField])> = Vec::new();
+                let mut renames: Vec<(String, String)> = Vec::new();
+                // RelRef children: element table + link table.
                 for nf in nested {
                     let tmp_child = child_table_name(tmp_parent, &nf.name);
                     let real_child = child_table_name(real_parent, &nf.name);
-                    // Grandchildren reference the tmp child's name; descend first.
-                    rename_nested_tables(conn, &tmp_child, &real_child, &nf.nested);
-                    // Rename the element table and its link table. Either may be
-                    // absent when the relation was empty (no rows written).
-                    for (from, to) in [
-                        (tmp_child.clone(), real_child.clone()),
-                        (format!("{}__link", tmp_child), format!("{}__link", real_child)),
-                    ] {
-                        let rename = format!(
-                            "ALTER TABLE {} RENAME TO {};",
-                            quote_ident(&from),
-                            quote_ident(&to)
-                        );
-                        debug_sql(&rename);
-                        let _ = conn.execute_batch(&rename);
+                    recurse.push((tmp_child.clone(), real_child.clone(), &nf.columns, &nf.nested));
+                    renames.push((tmp_child.clone(), real_child.clone()));
+                    renames.push((format!("{}__link", tmp_child), format!("{}__link", real_child)));
+                }
+                // RecRef / AdtRef columns: a single content-addressed child table.
+                for col in columns {
+                    match col.store.as_deref() {
+                        Some(FieldStore::RecRef(rec)) => {
+                            let tmp_child = child_table_name(tmp_parent, &col.name);
+                            let real_child = child_table_name(real_parent, &col.name);
+                            recurse.push((tmp_child.clone(), real_child.clone(), &rec.columns, &rec.nested));
+                            renames.push((tmp_child, real_child));
+                        }
+                        Some(FieldStore::AdtRef(_)) => {
+                            // A payload-ADT child is a wide table with no further nesting.
+                            let tmp_child = child_table_name(tmp_parent, &col.name);
+                            let real_child = child_table_name(real_parent, &col.name);
+                            renames.push((tmp_child, real_child));
+                        }
+                        _ => {}
                     }
+                }
+                for (tmp_child, real_child, cols, nest) in recurse {
+                    rename_child_tables(conn, &tmp_child, &real_child, cols, nest);
+                }
+                for (from, to) in renames {
+                    // The table may be absent when the field held no rows.
+                    let rename = format!(
+                        "ALTER TABLE {} RENAME TO {};",
+                        quote_ident(&from),
+                        quote_ident(&to)
+                    );
+                    debug_sql(&rename);
+                    let _ = conn.execute_batch(&rename);
                 }
             }
             let new_rec = parse_record_schema(new_schema);
-            rename_nested_tables(&db_ref.conn, &tmp_table_name, &table_name, &new_rec.nested);
+            rename_child_tables(&db_ref.conn, &tmp_table_name, &table_name, &new_rec.columns, &new_rec.nested);
         }
 
         // 5. Update stored schema and advance the migration cursor.

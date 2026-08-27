@@ -13510,6 +13510,15 @@ pub extern "C-unwind" fn knot_source_migrate(
             drop_nested_tables(&db_ref.conn, &table_name, &old_rec.columns, &old_rec.nested);
         }
 
+        // Suspend every trigger that references this table (subset-constraint
+        // triggers, whether defined ON this table or ON another table that
+        // references it). A trigger referencing `_knot_<name>` fires during the
+        // drop/rename below — while the table is absent — and SQLite aborts the
+        // whole statement. They are recreated from their captured SQL after the
+        // swap. (`suspend_del_triggers` handles only the full-replace path's
+        // BEFORE DELETE triggers; a migration must catch the whole set.)
+        let suspended_triggers = suspend_triggers_referencing(&db_ref.conn, &table_name);
+
         let drop_sql = format!("DROP TABLE IF EXISTS {};", table);
         debug_sql(&drop_sql);
         db_ref
@@ -13596,6 +13605,15 @@ pub extern "C-unwind" fn knot_source_migrate(
                 rusqlite::params![name, new_schema, step_idx + 1],
             )
             .expect("knot runtime: failed to update schema after migration");
+
+        // Restore the constraint triggers suspended before the swap.
+        for sql in &suspended_triggers {
+            debug_sql(sql);
+            db_ref
+                .conn
+                .execute_batch(sql)
+                .expect("knot runtime: failed to restore a constraint trigger after migration");
+        }
     });
 
     db_ref
@@ -16761,6 +16779,46 @@ fn parse_del_trigger(sql: &str) -> Option<(String, String, String)> {
         sub_col.to_string(),
         sup_col.to_string(),
     ))
+}
+
+/// Suspend (drop) every trigger whose body references `table`, returning the
+/// `CREATE TRIGGER` SQL for each so the caller can recreate them. A migration
+/// drops and renames a table; any trigger referencing it (a subset-constraint
+/// trigger ON the table, or a superset-side `_del`/`_supupd` trigger on another
+/// table that names it) fires mid-swap against a table that no longer exists,
+/// and SQLite aborts the statement. Unlike `suspend_del_triggers` (which the
+/// full-replace path uses for its narrow BEFORE DELETE set), this catches every
+/// trigger mentioning the table.
+fn suspend_triggers_referencing(conn: &Connection, table: &str) -> Vec<String> {
+    let quoted = quote_ident(table);
+    let pairs: Vec<(String, String)> = {
+        let mut stmt = match conn
+            .prepare("SELECT name, sql FROM sqlite_master WHERE type = 'trigger'")
+        {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let iter = match stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        }) {
+            Ok(it) => it,
+            Err(_) => return Vec::new(),
+        };
+        iter.flatten().collect()
+    };
+    let mut suspended = Vec::new();
+    for (name, sql) in pairs {
+        // The trigger references the table if the quoted name appears in its SQL.
+        if !sql.contains(&quoted) {
+            continue;
+        }
+        let drop_sql = format!("DROP TRIGGER IF EXISTS {};", quote_ident(&name));
+        debug_sql(&drop_sql);
+        if conn.execute_batch(&drop_sql).is_ok() {
+            suspended.push(sql);
+        }
+    }
+    suspended
 }
 
 /// Suspend (drop) every referential `BEFORE DELETE` trigger guarding `table` and

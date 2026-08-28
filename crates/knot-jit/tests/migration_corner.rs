@@ -1253,3 +1253,179 @@ Rel V2  *pets
         "the subset constraint still fires after migration: {stderr}"
     );
 }
+
+// ── Migration-lambda expressiveness ─────────────────────────────────────────
+// These exercise what the migration lambda can reference now that it's
+// type-checked with the full builtin scope (deferred past `pre_register`).
+
+/// The transform wraps a scalar in `Maybe.Just` — a builtin-ADT constructor in
+/// the migration lambda. (Regression: the lambda was checked before `Maybe`
+/// was in scope.)
+#[test]
+fn corner_scalar_to_maybe() {
+    let dir = dir_for("mig_to_maybe");
+    let v1 = r#"with {
+V1  {name Text}
+Rel V1  *people
+}
+(do
+  full *people = [{name "a"}]
+  yield {})"#;
+    let v2 = r#"with {
+V1  {name Text}
+V2  {name (Maybe Text)}
+Rel V2  *people
+  \p -> {name (Maybe.Just {value p.name})}
+}
+(do
+  yield {})"#;
+    let committed = r#"with {
+V1  {name Text}
+V2  {name (Maybe Text)}
+Rel V2  *people
+}
+(do
+  rows <- *people
+  base.println (base.show rows)
+  yield {})"#;
+    let out = lifecycle(&dir, "mig_to_maybe", v1, v2, committed);
+    assert_eq!(out, "\"[{name Just {value a}}]\"\n{}");
+}
+
+/// The transform unwraps a `Maybe` via a match — pattern-matching a builtin
+/// ADT's constructors in the migration lambda.
+#[test]
+fn corner_maybe_to_scalar() {
+    let dir = dir_for("mig_from_maybe");
+    let v1 = r#"with {
+V1  {name (Maybe Text)}
+Rel V1  *people
+}
+(do
+  full *people = [{name (Maybe.Just {value "a"})}  {name (Maybe.Nothing {})}]
+  yield {})"#;
+    let v2 = r#"with {
+V1  {name (Maybe Text)}
+V2  {name Text}
+Rel V2  *people
+  \p -> {name (match (p.name)
+    Maybe.Just {value v}  v
+    Maybe.Nothing {}  "anon")}
+}
+(do
+  yield {})"#;
+    let committed = r#"with {
+V1  {name (Maybe Text)}
+V2  {name Text}
+Rel V2  *people
+}
+(do
+  rows <- *people
+  base.println (base.show rows)
+  yield {})"#;
+    let out = lifecycle(&dir, "mig_from_maybe", v1, v2, committed);
+    assert_eq!(out, "\"[{name a}, {name anon}]\"\n{}");
+}
+
+/// The transform computes a new field arithmetically from an old one. A
+/// refined-Int field supports `Num` ops in the migration lambda. (Regression:
+/// arithmetic on a refined field failed before builtins were in scope.)
+#[test]
+fn corner_arithmetic_computed_field() {
+    let dir = dir_for("mig_arith");
+    let v1 = r#"with {
+V1  {age (Int 1)}
+Rel V1  *r
+}
+(do
+  full *r = [{age 5}]
+  yield {})"#;
+    let v2 = r#"with {
+V1  {age (Int 1)}
+V2  {age (Int 1)  doubled (Int 1)}
+Rel V2  *r
+  \p -> {age p.age  doubled (p.age * 2)}
+}
+(do
+  yield {})"#;
+    let committed = r#"with {
+V1  {age (Int 1)}
+V2  {age (Int 1)  doubled (Int 1)}
+Rel V2  *r
+}
+(do
+  rows <- *r
+  base.println (base.show rows)
+  yield {})"#;
+    let out = lifecycle(&dir, "mig_arith", v1, v2, committed);
+    assert_eq!(out, "\"[{age 5  doubled 10}]\"\n{}");
+}
+
+/// The transform retypes via a stdlib call (`base.show`). (Regression: `base`
+/// wasn't in the migration lambda's scope.)
+#[test]
+fn corner_retype_via_base_show() {
+    let dir = dir_for("mig_base_show");
+    let v1 = r#"with {
+V1  {n (Int 1)}
+Rel V1  *r
+}
+(do
+  full *r = [{n 7}]
+  yield {})"#;
+    let v2 = r#"with {
+V1  {n (Int 1)}
+V2  {n Text}
+Rel V2  *r
+  \p -> {n (base.show p.n)}
+}
+(do
+  yield {})"#;
+    let committed = r#"with {
+V1  {n (Int 1)}
+V2  {n Text}
+Rel V2  *r
+}
+(do
+  rows <- *r
+  base.println (base.show rows)
+  yield {})"#;
+    let out = lifecycle(&dir, "mig_base_show", v1, v2, committed);
+    assert_eq!(out, "\"[{n 7}]\"\n{}");
+}
+
+// ── ADT evolution ────────────────────────────────────────────────────────────
+
+/// An ADT source gains a constructor (additive): existing rows keep their tag.
+#[test]
+fn corner_adt_gains_constructor() {
+    let dir = dir_for("mig_adt_add");
+    let v1 = r#"with {
+Ev  Ping {}  Msg {text Text}
+Rel Ev  *evs
+}
+(do
+  full *evs = [(Ev.Ping {})  (Ev.Msg {text "hi"})]
+  yield {})"#;
+    let v2 = r#"with {
+Ev  Ping {}  Msg {text Text}
+EvV2  Ping {}  Msg {text Text}  Kick {}
+Rel EvV2  *evs
+  \e -> (match (e)
+    Ev.Ping {}  (EvV2.Ping {})
+    Ev.Msg {text t}  (EvV2.Msg {text t}))
+}
+(do
+  yield {})"#;
+    let committed = r#"with {
+Ev  Ping {}  Msg {text Text}
+EvV2  Ping {}  Msg {text Text}  Kick {}
+Rel EvV2  *evs
+}
+(do
+  rows <- *evs
+  base.println (base.show rows)
+  yield {})"#;
+    let out = lifecycle(&dir, "mig_adt_add", v1, v2, committed);
+    assert_eq!(out, "\"[Ping, Msg {text hi}]\"\n{}");
+}

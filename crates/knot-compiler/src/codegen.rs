@@ -1637,6 +1637,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
         self.declare_rt("knot_schema_init", &[p], &[]);
         // migrate carries its chain step index (I64) as the migration cursor.
         self.declare_rt("knot_source_migrate", &[p, p, p, p, p, p, p, types::I64, p], &[]);
+        // The group savepoint wrapping a program's whole migration phase, so a
+        // failure in any one source rolls all of them back.
+        self.declare_rt("knot_migrate_group_begin", &[p], &[]);
+        self.declare_rt("knot_migrate_group_end", &[p], &[]);
         self.declare_rt(
             "knot_source_migrate_preview",
             &[p, p, p, p, p, p, p, p],
@@ -4475,6 +4479,15 @@ impl<M: cranelift_module::Module> Codegen<M> {
             }
             relations.sort();
 
+            // Wrap the whole migration phase in one group savepoint so a failure
+            // in any source's migration rolls all of them back. The per-source
+            // `knot_migrate` savepoints nest inside it; a panic leaves the group
+            // uncommitted, and process exit discards it (DB unchanged).
+            let any_migrations = !relations.is_empty();
+            if any_migrations {
+                cg.call_rt_void(builder, "knot_migrate_group_begin", &[db]);
+            }
+
             for relation in relations {
                 // Assemble (old_schema, new_schema, using_fn) steps: committed
                 // chain first, then the pending step (if any).
@@ -4547,6 +4560,12 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         ],
                     );
                 }
+            }
+
+            // All migrations committed: release the group savepoint. Only when
+            // one was opened (the begin is guarded the same way).
+            if any_migrations {
+                cg.call_rt_void(builder, "knot_migrate_group_end", &[db]);
             }
 
             // Drop sources removed from the codebase (still tracked by the

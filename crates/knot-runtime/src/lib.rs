@@ -13634,6 +13634,29 @@ pub extern "C-unwind" fn knot_source_migrate(
     ));
 }
 
+/// Open the group savepoint wrapping a program's whole migration phase. Each
+/// source's own `knot_migrate` savepoint nests inside it; a failure in any one
+/// source rolls the whole group back, so the database is never left with some
+/// sources migrated and others not.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_migrate_group_begin(db: *mut c_void) {
+    let db_ref = unsafe { &*(db as *const KnotDb) };
+    db_ref
+        .conn
+        .execute_batch("SAVEPOINT knot_migrate_all;")
+        .expect("knot runtime: failed to begin group migration savepoint");
+}
+
+/// Release the group savepoint after every source's migration committed.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_migrate_group_end(db: *mut c_void) {
+    let db_ref = unsafe { &*(db as *const KnotDb) };
+    db_ref
+        .conn
+        .execute_batch("RELEASE SAVEPOINT knot_migrate_all;")
+        .expect("knot runtime: failed to release group migration savepoint");
+}
+
 /// Compute a source's migrated rows *without* persisting them, so the compiler
 /// can run refinement validation on the transformed data before the
 /// destructive `knot_source_migrate` write (mirroring the set/replace/view

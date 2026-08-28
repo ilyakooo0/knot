@@ -10888,7 +10888,9 @@ impl Infer {
             ),
         );
 
-        // count : ∀a u. [a] -> Int u
+        // count : ∀a u. [a] -> IO (Int u)
+        // Reading a relation is a DB effect — count forces the query, so the
+        // result is IO. The in-memory Vec overload (`vecCount`) stays pure.
         {
             let a = self.fresh_var();
             let u = self.fresh_unit_var();
@@ -10902,7 +10904,7 @@ impl Infer {
                     unit_binops: vec![],
                     ty: Ty::Fun(
                         Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
-                        Box::new(int_u),
+                        Box::new(Ty::IO(Box::new(int_u))),
                     ),
                 },
             );

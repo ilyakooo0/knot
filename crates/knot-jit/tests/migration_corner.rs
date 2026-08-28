@@ -415,7 +415,7 @@ Rel Ev  *evs
 Ev  Ping {}  Msg {text Text}
 EvV2  Ping {}  Msg {text Text  loud (Int 1)}
 Rel EvV2  *evs
-  \e -> (match (e)
+  \e -> (? (e)
     Ev.Ping {}  (EvV2.Ping {})
     Ev.Msg {text t}  (EvV2.Msg {text t  loud 0}))
 }
@@ -1308,7 +1308,7 @@ Rel V1  *people
 V1  {name (Maybe Text)}
 V2  {name Text}
 Rel V2  *people
-  \p -> {name (match (p.name)
+  \p -> {name (? (p.name)
     Maybe.Just {value v}  v
     Maybe.Nothing {}  "anon")}
 }
@@ -1411,7 +1411,7 @@ Rel Ev  *evs
 Ev  Ping {}  Msg {text Text}
 EvV2  Ping {}  Msg {text Text}  Kick {}
 Rel EvV2  *evs
-  \e -> (match (e)
+  \e -> (? (e)
     Ev.Ping {}  (EvV2.Ping {})
     Ev.Msg {text t}  (EvV2.Msg {text t}))
 }

@@ -22,7 +22,7 @@ fn wrong_arg_type() {
 #[test]
 fn non_exhaustive_case() {
     assert_compile_err(
-        "(match (Maybe.Nothing {})\n  Maybe.Just {value v}  v)",
+        "(? (Maybe.Nothing {})\n  Maybe.Just {value v}  v)",
         "",
     );
 }
@@ -46,7 +46,7 @@ fn mixed_relation_literal() {
 fn if_without_else_type() {
     // match arms must agree in type.
     assert_compile_err(
-        "(match (1 == 1)\n  Bool.True {}  1\n  Bool.False {}  \"x\")",
+        "(? (1 == 1)\n  Bool.True {}  1\n  Bool.False {}  \"x\")",
         "",
     );
 }

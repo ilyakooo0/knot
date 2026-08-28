@@ -62,7 +62,7 @@ fn traverse_maybe_and_result() {
     assert_stdout(
         "traverse_maybe",
         r#"with {
-Int 1 -> Maybe (Int 1)  pos  (\x -> match (x > 0)
+Int 1 -> Maybe (Int 1)  pos  (\x -> ? (x > 0)
   Bool.True {}  Maybe.Just {value x}
   Bool.False {}  Maybe.Nothing {})
 }
@@ -80,7 +80,7 @@ Int 1 -> Maybe (Int 1)  pos  (\x -> match (x > 0)
 fn when_unless() {
     // when/unless are IO-conditional; here we just confirm a match on Bool.
     assert_show(
-        "(match (2 > 1)\n  Bool.True {}  1\n  Bool.False {}  0)",
+        "(? (2 > 1)\n  Bool.True {}  1\n  Bool.False {}  0)",
         "1",
     );
 }
@@ -88,7 +88,7 @@ fn when_unless() {
 #[test]
 fn case_as_expression() {
     assert_show(
-        "base.length (match (1 == 1)\n  Bool.True {}  \"yes\"\n  Bool.False {}  \"nope\")",
+        "base.length (? (1 == 1)\n  Bool.True {}  \"yes\"\n  Bool.False {}  \"nope\")",
         "3",
     );
 }
@@ -239,7 +239,7 @@ fn io_arg_to_dropping_fn_does_not_run() {
 _  ignore  (\io -> 7)
 }
 (do
-  ignore (match (Bool.True {})
+  ignore (? (Bool.True {})
     (Bool.True {})   (base.println "FIRED")
     (Bool.False {})  (base.println "other"))
   base.println "done"
@@ -275,7 +275,7 @@ fn io_arg_to_running_fn_still_runs() {
 _  runIt  (\io -> base.run io)
 }
 (do
-  runIt (match (Bool.True {})
+  runIt (? (Bool.True {})
     (Bool.True {})   (base.println "ran")
     (Bool.False {})  (base.println "other"))
   base.println "done"

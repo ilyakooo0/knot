@@ -623,7 +623,6 @@ impl Parser {
             }
             TokenKind::Where
             | TokenKind::Do
-            | TokenKind::Match
             | TokenKind::Not
             | TokenKind::Full
             | TokenKind::Atomic
@@ -1355,7 +1354,10 @@ impl Parser {
         }
         match self.peek() {
             TokenKind::Backslash => self.parse_lambda(),
-            TokenKind::Match => self.parse_case(),
+            // `? (x)` opens a match. `?` in atom position is unambiguous: its
+            // other uses are in route query params and type position, never
+            // where an expression begins.
+            TokenKind::Question => self.parse_case(),
             TokenKind::Do => self.parse_do_expr(),
             // `< Api` opens a serve block. `<` in atom position is unambiguous:
             // a comparison `a < b` has a left operand, so a leading `<` is
@@ -1624,7 +1626,7 @@ impl Parser {
             }
             let rhs = if matches!(
                 self.peek(),
-                TokenKind::Match
+                TokenKind::Question
                     | TokenKind::Do
                     | TokenKind::Backslash
                     | TokenKind::Atomic
@@ -3084,15 +3086,15 @@ impl Parser {
             return None;
         }
         let result = self.in_context("match expression", |this| {
-            this.advance(); // consume `match`
+            this.advance(); // consume `?`
 
-            // The scrutinee must be parenthesized: `match (expr)`. The parens
+            // The scrutinee must be parenthesized: `? (expr)`. The parens
             // delimit the scrutinee expression itself. We still suppress
             // newline-application while parsing it, because the closing `)` is
             // a complete atom and the application parser would otherwise apply
-            // the following indented arm to it (`match (x)\n  5` → `(x) 5`).
+            // the following indented arm to it (`? (x)\n  5` → `(x) 5`).
             if !this.at(&TokenKind::LParen) {
-                this.error("the match scrutinee must be parenthesized: `match (expr)`");
+                this.error("the match scrutinee must be parenthesized: `? (expr)`");
                 return None;
             }
             let saved_scrut = this.no_newline_app;

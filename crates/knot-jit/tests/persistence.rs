@@ -94,7 +94,7 @@ fn traverse_io() {
 fn compile_result_ok() {
     assert_stdout(
         "compile_ok",
-        r#"(match (base.the (Result Text (Int 1)) (base.compile "40 + 2"))
+        r#"(? (base.the (Result Text (Int 1)) (base.compile "40 + 2"))
   Result.Ok {value v}  base.println ("ok: " ++ base.show v)
   Result.Err {error e}  base.println ("err: " ++ e))"#,
         "\"ok: 42\"\n{}",
@@ -105,7 +105,7 @@ fn compile_result_ok() {
 fn compile_result_err_on_mismatch() {
     assert_stdout(
         "compile_err",
-        r#"(match (base.the (Result Text (Int 1)) (base.compile "\"text\""))
+        r#"(? (base.the (Result Text (Int 1)) (base.compile "\"text\""))
   Result.Ok {value v}  base.println "ok"
   Result.Err {error e}  base.println "err")"#,
         "\"err\"\n{}",
@@ -116,7 +116,7 @@ fn compile_result_err_on_mismatch() {
 fn compile_err_on_invalid_source() {
     assert_stdout(
         "compile_bad",
-        r#"(match (base.the (Result Text (Int 1)) (base.compile "1 +"))
+        r#"(? (base.the (Result Text (Int 1)) (base.compile "1 +"))
   Result.Ok {value v}  base.println "ok"
   Result.Err {error e}  base.println "err")"#,
         "\"err\"\n{}",
@@ -138,9 +138,9 @@ Rel Account  *accounts
   _ <- atomic do
     rows <- *accounts
     *accounts = base.map (\a ->
-      match (a.name == "from")
+      ? (a.name == "from")
         Bool.True {}  (base.unify a {balance (a.balance - 40)})
-        Bool.False {}  (match (a.name == "to")
+        Bool.False {}  (? (a.name == "to")
           Bool.True {}  (base.unify a {balance (a.balance + 40)})
           Bool.False {}  a)) rows
     yield {}

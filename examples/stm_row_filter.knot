@@ -16,7 +16,7 @@ _  findById  (\aid rows -> base.single (base.filter (\a -> a.id == aid) rows))
 
 _  setBalance  (\aid newBalance rows -> do
   r <- rows
-  yield (match (r.id == aid)
+  yield (? (r.id == aid)
     Bool.True {}  (base.unify r {balance newBalance})
     Bool.False {}  r))
 

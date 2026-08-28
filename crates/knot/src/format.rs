@@ -746,7 +746,7 @@ fn render_expr_inline(e: &Expr, parent: Prec) -> String {
             // from the next arm's pattern unambiguously), so render multi-line.
             // The lockfile stores this with newlines escaped (\n), which the
             // string lexer reads back, so the round-trip preserves the layout.
-            let mut s = format!("match ({})", render_expr_inline(scrutinee, Prec::Lowest));
+            let mut s = format!("? ({})", render_expr_inline(scrutinee, Prec::Lowest));
             for arm in arms {
                 s.push_str("\n  ");
                 s.push_str(&render_pat(&arm.pat));
@@ -1287,14 +1287,15 @@ fn render_case_block(p: &mut Printer, scrut: &Expr, arms: &[CaseArm], parent: Pr
     if need_parens {
         p.write("(");
     }
-    p.write("case ");
+    p.write("? (");
     render_expr(p, scrut, Prec::Lowest);
-    p.write(" of");
+    p.write(")");
     p.newline();
     p.with_indent(|p| {
         for (i, arm) in arms.iter().enumerate() {
             p.write(&render_pat(&arm.pat));
-            p.write(" -> ");
+            // knot match arms are gap-separated (no `->`).
+            p.write("  ");
             render_expr(p, &arm.body, Prec::Lowest);
             if i + 1 < arms.len() {
                 p.newline();

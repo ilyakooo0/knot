@@ -16,17 +16,17 @@
     -- input is recoverable rather than fatal — match on the result.
     with {  json (base.toJson {  x 10  y 20 }) } (do
       base.println json
-      match (base.the (Maybe {x (Int 1)  y (Int 1)}) (base.parseJson json))
+      ? (base.the (Maybe {x (Int 1)  y (Int 1)}) (base.parseJson json))
         Maybe.Just {  value value }  base.println (base.show value)
         Maybe.Nothing {}  base.println "parse failed"
 
       -- Parse a JSON array
-      match (base.the (Maybe (Rel (Int 1))) (base.parseJson "[1, 2, 3]"))
+      ? (base.the (Maybe (Rel (Int 1))) (base.parseJson "[1, 2, 3]"))
         Maybe.Just {  value value }  base.println (base.show value)
         Maybe.Nothing {}  base.println "parse failed"
 
       -- Malformed input decodes to Nothing instead of crashing the program
-      match (base.the (Maybe (Rel (Int 1))) (base.parseJson "not valid json"))
+      ? (base.the (Maybe (Rel (Int 1))) (base.parseJson "not valid json"))
         Maybe.Just {  value value }  base.println (base.show value)
         Maybe.Nothing {}  base.println "parse failed (as expected)"
 

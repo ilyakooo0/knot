@@ -36,7 +36,7 @@ fn bytes_hex_roundtrip() {
     assert_show("base.bytesToHex (base.textToBytes \"hi\")", "6869");
     // hexDecode returns Maybe Bytes (Nothing on malformed) — unwrap to round-trip
     assert_show(
-        "match (base.hexDecode (base.bytesToHex (base.textToBytes \"hi\")))
+        "? (base.hexDecode (base.bytesToHex (base.textToBytes \"hi\")))
            Maybe.Just {value b}  base.bytesToText b
            Maybe.Nothing {}  Maybe.Nothing {}",
         "Just {value hi}",

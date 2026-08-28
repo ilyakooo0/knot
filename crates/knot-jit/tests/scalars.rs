@@ -164,7 +164,7 @@ fn bytes_invalid_utf8() {
     // 0xff is never valid UTF-8. bytesFromHex gives Maybe Bytes, so unwrap via
     // a match before decoding to Text.
     assert_show(
-        "(match (base.bytesFromHex \"ff\")\n  Maybe.Just {value b}  base.bytesToText b\n  Maybe.Nothing {}  Maybe.Just {value \"unexpected\"})",
+        "(? (base.bytesFromHex \"ff\")\n  Maybe.Just {value b}  base.bytesToText b\n  Maybe.Nothing {}  Maybe.Just {value \"unexpected\"})",
         "Nothing",
     );
 }

@@ -16,7 +16,7 @@ discountDemo (do
   items <- *items
   with {discounted (do
     i <- items
-    yield (match (i.price > 20)
+    yield (? (i.price > 20)
       Bool.True {}  (base.unify i {price (i.price - 5)})
       Bool.False {}  i))} *items = discounted)
 

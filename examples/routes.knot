@@ -16,12 +16,12 @@ _  addTodo  (\title owner priority -> do
 
 srv (< Api
   GetTodos = \{owner owner  xForwardedFor xForwardedFor} -> do
-    match (xForwardedFor)
+    ? (xForwardedFor)
       Maybe.Just {value ip}  base.info ("GetTodos from " ++ ip)
       Maybe.Nothing {}  base.info "GetTodos (no proxy header)"
     rows <- *todos
     with {matching (base.filter (\t -> t.owner == owner) rows)} (do
-      match (base.count matching == 0)
+      ? (base.count matching == 0)
         Bool.True {}  yield (Result.Err {error {status 404  message "no todos found for owner"}})
         Bool.False {}  yield (Result.Ok {value matching}))
   CreateTodo = \{title title  owner owner  priority priority} -> do

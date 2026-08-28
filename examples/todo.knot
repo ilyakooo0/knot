@@ -11,7 +11,7 @@ _  complete  (\title -> do
   todos <- *todos
   *todos = do
     t <- todos
-    yield (match (t.title == title)
+    yield (? (t.title == title)
       Bool.True {}  (base.unify t {done 1})
       Bool.False {}  t))
 

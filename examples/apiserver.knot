@@ -45,7 +45,7 @@ api Tasks where
     rateLimit {key (\i c -> Maybe.Just {value "global"})
                limit {requests 100  window 60000}}
 
-nextId (\rows -> match (rows)
+nextId (\rows -> ? (rows)
   []  1
   Cons _ _  base.count rows + 1)
 

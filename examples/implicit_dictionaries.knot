@@ -3,25 +3,25 @@
 -- `clamp` needs a `compare` dictionary but doesn't name it. The compiler
 -- resolves the dictionary from lexical scope at each full-arity callsite.
 with {
-intOrd {compare (\a b -> match (a > b)
+intOrd {compare (\a b -> ? (a > b)
   Bool.True {}  1
-  Bool.False {}  match (a < b)
+  Bool.False {}  ? (a < b)
     Bool.True {}  (0 - 1)
     Bool.False {}  0)}
-textOrd {compare (\a b -> match (a > b)
+textOrd {compare (\a b -> ? (a > b)
   Bool.True {}  1
-  Bool.False {}  match (a < b)
+  Bool.False {}  ? (a < b)
     Bool.True {}  (0 - 1)
     Bool.False {}  0)}
-intOrdDesc {compare (\a b -> match (a < b)
+intOrdDesc {compare (\a b -> ? (a < b)
   Bool.True {}  1
-  Bool.False {}  match (a > b)
+  Bool.False {}  ? (a > b)
     Bool.True {}  (0 - 1)
     Bool.False {}  0)}
 
-((a -> a -> Int 1)  ^compare) =>  a ->  a ->  a ->  a  clamp  (\lo hi x -> match ((^compare) x lo) < 0
+((a -> a -> Int 1)  ^compare) =>  a ->  a ->  a ->  a  clamp  (\lo hi x -> ? ((^compare) x lo) < 0
   Bool.True {}  lo
-  Bool.False {}  match ((^compare) x hi) > 0
+  Bool.False {}  ? ((^compare) x hi) > 0
     Bool.True {}  hi
     Bool.False {}  x)
 }

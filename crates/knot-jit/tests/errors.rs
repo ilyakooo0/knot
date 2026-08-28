@@ -10,7 +10,7 @@ fn result_do_block_all_ok() {
     assert_show(
         "with {
 Int 1 -> Result Text (Int 1)  f  (\\x -> Result.Ok {value (x + 1)}) }
-         (match (do
+         (? (do
             a <- f 1
             b <- f a
             yield b)
@@ -25,10 +25,10 @@ fn result_do_block_short_circuits_on_err() {
     // The Err from the first bind short-circuits; the second bind never runs.
     assert_show(
         "with {
-Int 1 -> Result Text (Int 1)  f  (\\x -> match (x == 0)
+Int 1 -> Result Text (Int 1)  f  (\\x -> ? (x == 0)
                           Bool.True {}  Result.Err {error \"stop\"}
                           Bool.False {}  Result.Ok {value x}) }
-         (match (do
+         (? (do
             a <- f 0
             b <- f a
             yield b)
@@ -42,10 +42,10 @@ Int 1 -> Result Text (Int 1)  f  (\\x -> match (x == 0)
 fn maybe_bind_short_circuits_on_nothing() {
     assert_show(
         "with {
-Int 1 -> Maybe (Int 1)  f  (\\x -> match (x == 0)
+Int 1 -> Maybe (Int 1)  f  (\\x -> ? (x == 0)
                           Bool.True {}  Maybe.Nothing {}
                           Bool.False {}  Maybe.Just {value x}) }
-         (match (do
+         (? (do
             a <- f 0
             b <- f a
             yield b)

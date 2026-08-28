@@ -424,7 +424,6 @@ pub fn collect_keyword_operator_positions(tokens: &[knot::lexer::Token]) -> Vec<
         let tok_type = match &token.kind {
             TokenKind::Where
             | TokenKind::Do
-            | TokenKind::Match
             | TokenKind::Not
             | TokenKind::Full
             | TokenKind::Atomic

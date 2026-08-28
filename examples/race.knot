@@ -17,14 +17,14 @@ fast (do
   start1 <- base.now
   r1 <- base.race slow fast
   end1 <- base.now
-  match (r1)
+  ? (r1)
     Result.Err {error a}  base.println ("left won: " ++ a)
     Result.Ok {value b}  base.println ("right won: " ++ b)
   base.println ("  race 1 took " ++ base.show (base.stripUnit (end1 - start1)) ++ "ms")
   start2 <- base.now
   r2 <- base.race fast slow
   end2 <- base.now
-  match (r2)
+  ? (r2)
     Result.Err {error a}  base.println ("left won: " ++ a)
     Result.Ok {value b}  base.println ("right won: " ++ b)
   base.println ("  race 2 took " ++ base.show (base.stripUnit (end2 - start2)) ++ "ms"))

@@ -138,7 +138,8 @@ fn extract_record_nested() {
 
 #[test]
 fn extract_record_mixed_types() {
-    // Record fields render in the internal hash order, not source order.
+    // Record fields render name-sorted (the canonical storage order — records
+    // are sorted by name at construction for binary search). Not source order.
     assert_show(
         "base.extract {name \"a\"  age 30  ok (Bool.True {})}",
         "{age 30  name \"a\"  ok Bool.True {}}",

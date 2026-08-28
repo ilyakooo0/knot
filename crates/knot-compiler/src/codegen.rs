@@ -4161,6 +4161,45 @@ impl<M: cranelift_module::Module> Codegen<M> {
             // Compile the body into `knot_user_main`.
             self.build_function(fid, msig, |cg, builder, entry| {
                 let db = builder.block_params(entry)[0];
+                // Register ctor order + decl source text here (in
+                // `knot_user_main`, the snippet entry) rather than only in the
+                // C `main` prologue: the JIT runs `knot_user_main` directly and
+                // never reaches C `main`, so registration must live here for
+                // `extract`/structural-Ord to work in-process too.
+                for decl in &decls {
+                    if let DeclViewKind::Data { ctors, .. } = decl.kind {
+                        let ctor_list = ctors
+                            .iter()
+                            .map(|c| c.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        let (name_ptr, name_len) = cg.string_ptr(builder, decl.name);
+                        let (ctors_ptr, ctors_len) = cg.string_ptr(builder, &ctor_list);
+                        cg.call_rt_void(
+                            builder,
+                            "knot_register_ctor_order",
+                            &[name_ptr, name_len, ctors_ptr, ctors_len],
+                        );
+                        // Register the decl's source text so `extract` can
+                        // inline it (`with {data …} (…)`), making an extracted
+                        // ADT value self-contained. Skip builtins — their spans
+                        // are shifted into the prelude.
+                        let (ds, de) = (decl.span.start, decl.span.end);
+                        if de > ds
+                            && de <= cg.source_text.len()
+                            && decl.span.start < crate::base::PRELUDE_SPAN_OFFSET
+                        {
+                            let decl_src = cg.source_text[ds..de].to_string();
+                            let (n_ptr, n_len) = cg.string_ptr(builder, decl.name);
+                            let (d_ptr, d_len) = cg.string_ptr(builder, &decl_src);
+                            cg.call_rt_void(
+                                builder,
+                                "knot_register_data_decl",
+                                &[n_ptr, n_len, d_ptr, d_len],
+                            );
+                        }
+                    }
+                }
                 let mut env = Env::new();
                 let result = cg.compile_expr(builder, body, &mut env, db);
                 builder.ins().return_(&[result]);
@@ -4390,47 +4429,11 @@ impl<M: cranelift_module::Module> Codegen<M> {
             // Custom ToJSON impls are gone with trait dispatch; the runtime
             // falls back to its structural encoder when nothing is registered.
 
-            // Register constructor declaration order for every `data`
-            // declaration. Structural `Ord` on an ADT follows the order the
-            // constructors were written in, and a `Value::Constructor` carries
-            // only its tag, so the runtime needs the order handed to it.
-            for decl in &decls {
-                if let DeclViewKind::Data { ctors, .. } = decl.kind {
-                    let ctor_list = ctors
-                        .iter()
-                        .map(|c| c.name.as_str())
-                        .collect::<Vec<_>>()
-                        .join(",");
-                    let (name_ptr, name_len) = cg.string_ptr(builder, decl.name);
-                    let (ctors_ptr, ctors_len) = cg.string_ptr(builder, &ctor_list);
-                    cg.call_rt_void(
-                        builder,
-                        "knot_register_ctor_order",
-                        &[name_ptr, name_len, ctors_ptr, ctors_len],
-                    );
-
-                    // Register the decl's source text so `extract` can inline it
-                    // (`with {data …} (…)`), making an extracted ADT value
-                    // self-contained. Slice the original `data X = …` from the
-                    // program source via the decl's span. Skip builtins — their
-                    // spans are shifted into the prelude and they need no inline
-                    // declaration anyway.
-                    let (ds, de) = (decl.span.start, decl.span.end);
-                    if de > ds
-                        && de <= cg.source_text.len()
-                        && decl.span.start < crate::base::PRELUDE_SPAN_OFFSET
-                    {
-                        let decl_src = cg.source_text[ds..de].to_string();
-                        let (n_ptr, n_len) = cg.string_ptr(builder, decl.name);
-                        let (d_ptr, d_len) = cg.string_ptr(builder, &decl_src);
-                        cg.call_rt_void(
-                            builder,
-                            "knot_register_data_decl",
-                            &[n_ptr, n_len, d_ptr, d_len],
-                        );
-                    }
-                }
-            }
+            // Constructor order + decl source text are registered in
+            // `knot_user_main` (the snippet entry), which this C `main` calls
+            // below — registering there covers both the binary and the JIT
+            // path (the JIT runs `knot_user_main` directly and never reaches
+            // this C `main`).
 
             // User `Ord` impls are gone with trait dispatch; sortBy/minOn/maxOn
             // use the runtime's structural comparison directly, so no

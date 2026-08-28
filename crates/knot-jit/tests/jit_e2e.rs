@@ -73,3 +73,27 @@ fn jit_surfaces_text_body_type() {
     let out = compile_and_run("\"hello\"", db, None).expect("JIT compile failed");
     assert_eq!(out.ty.as_deref(), Some("Text"));
 }
+
+/// A user ADT extracted in the JIT renders self-contained: the declaration is
+/// inlined (`with {…} (Type.Ctor …)`), matching the compiled-binary path.
+/// Regression: the ctor-decl registration lived in the C `main` prologue,
+/// which the JIT never runs, so a JIT extract rendered the bare leaf form.
+#[test]
+fn jit_extract_user_adt_is_self_contained() {
+    use knot_runtime::Value;
+    init_compile_rt();
+    let db = db();
+    // Top-level decl + body, no harness `base.show` wrap — so `decl_views`
+    // sees `Priority` and registers its decl.
+    let out = compile_and_run(
+        "with {\nPriority  Low {}  High {}\n}\n(base.extract (Priority.Low {}))",
+        db,
+        None,
+    )
+    .expect("JIT compile failed");
+    let text = match unsafe { &*out.value.cast::<Value>() } {
+        Value::Text(s) => s.to_string(),
+        _ => panic!("expected Text from base.extract"),
+    };
+    assert_eq!(text, "with {Priority  Low {}  High {}} (Priority.Low {})");
+}

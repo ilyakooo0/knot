@@ -14,7 +14,7 @@ _  addTodo  (\title owner priority -> do
   rows <- *todos
   *todos = base.union rows [{title title  owner owner  priority (Priority.Low {})}])
 
-srv (serve Api where
+srv (< Api
   GetTodos = \{owner owner  xForwardedFor xForwardedFor} -> do
     match (xForwardedFor)
       Maybe.Just {value ip}  base.info ("GetTodos from " ++ ip)

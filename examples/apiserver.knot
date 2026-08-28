@@ -56,7 +56,7 @@ addTask (\title owner -> do
 
 findById (\tid rows -> base.filter (\t -> t.id == tid) rows)
 
-srv (serve Tasks where
+srv (< Tasks
   List = \{} -> do
     rows <- *tasks
     yield (Result.Ok {value rows})

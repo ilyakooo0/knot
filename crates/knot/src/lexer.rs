@@ -20,7 +20,6 @@ pub enum TokenKind {
     Upper(String),
 
     // Keywords
-    Serve,
     Where,
     Do,
     Match,
@@ -104,7 +103,6 @@ impl TokenKind {
             TokenKind::Text(_) => "string literal",
             TokenKind::Lower(_) => "identifier",
             TokenKind::Upper(_) => "type name",
-            TokenKind::Serve => "'serve'",
             TokenKind::Where => "'where'",
             TokenKind::Do => "'do'",
             TokenKind::Match => "'match'",
@@ -162,7 +160,6 @@ impl TokenKind {
     /// If this token is a keyword, return its string representation.
     pub fn keyword_str(&self) -> Option<&'static str> {
         match self {
-            TokenKind::Serve => Some("serve"),
             TokenKind::Where => Some("where"),
             TokenKind::Do => Some("do"),
             TokenKind::Match => Some("match"),
@@ -553,7 +550,6 @@ impl<'src> Lexer<'src> {
         // Keywords (only lowercase identifiers can be keywords)
         if first.is_ascii_lowercase() || first == b'_' {
             match text {
-                "serve" => return TokenKind::Serve,
                 "where" => return TokenKind::Where,
                 "do" => return TokenKind::Do,
                 "match" => return TokenKind::Match,

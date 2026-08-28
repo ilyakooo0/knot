@@ -430,7 +430,6 @@ pub fn collect_keyword_operator_positions(tokens: &[knot::lexer::Token]) -> Vec<
             | TokenKind::Atomic
             | TokenKind::With
             | TokenKind::Refine
-            | TokenKind::Serve
             | TokenKind::Forall => Some(TOK_KEYWORD),
             TokenKind::Plus
             | TokenKind::Minus

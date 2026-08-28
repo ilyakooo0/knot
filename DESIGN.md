@@ -888,7 +888,7 @@ route Api where
   PUT {owner: Text, person: Text} /todos/{title: Text}/assign -> {ok: Bool} = AssignTodo
 ```
 
-Handlers are bound per-endpoint with `serve API where` — the compiler ensures every endpoint has exactly one handler:
+Handlers are bound per-endpoint with `< API` — the compiler ensures every endpoint has exactly one handler:
 
 ```knot
 data Priority = Low {} | High {}
@@ -917,7 +917,7 @@ pendingFor \user page limit -> do
   todos <- full *todos
   with {result (do t <- todos; where t.owner == user; yield t)} yield result
 
-api (serve Api where
+api (< Api
   GetTodos = \{user user page page limit limit} -> do
     todos <- pendingFor user page limit
     yield (Result.Ok {value todos})
@@ -929,7 +929,7 @@ api (serve Api where
     yield (Result.Ok {value {ok (Bool.True {})}}))
 ```
 
-`serve API where` produces a value of type `Server API`. Each handler receives the request record (path/query/body/header fields) and returns `Result HttpError T`, where `T` is the response type declared on the endpoint and `HttpError = {status: Int 1, message: Text}`. `listen : Int u -> Server a -> IO {}` binds the server to a port. No string routes, no untyped params, no missing handlers.
+`< API` produces a value of type `Server API`. Each handler receives the request record (path/query/body/header fields) and returns `Result HttpError T`, where `T` is the response type declared on the endpoint and `HttpError = {status: Int 1, message: Text}`. `listen : Int u -> Server a -> IO {}` binds the server to a port. No string routes, no untyped params, no missing handlers.
 
 #### HTTP Status Codes
 
@@ -942,7 +942,7 @@ route Api where
   GET /users/{id: Int 1} -> Person = GetUser
   POST {name: Text, email: Text} /users -> {name: Text, email: Text} = CreateUser
 
-api (serve Api where
+api (< Api
   GetUser = \{id id} -> do
     users <- full *people
     case base.filter (\u -> u.id == id) users of
@@ -998,7 +998,7 @@ addTodo \title -> do
   *todos = base.union todos [{title title}]
   yield {id 1}
 
-api (serve Api where
+api (< Api
   GetTodos = \{authorization authorization} -> do
     todos <- full *todos
     yield (Result.Ok {value {body todos headers {xTotalCount (base.count todos) xPage 1}}})
@@ -1153,7 +1153,7 @@ DB writes within handlers must use `atomic`. IO happens outside `atomic`:
 route Api where
   POST {item: Text, qty: Int 1} /orders -> {orderId: Int 1} = CreateOrder
 
-api (serve Api where
+api (< Api
   CreateOrder = \{item item qty qty} -> do
     orderId <- atomic do
       orders <- full *orders
@@ -1929,7 +1929,7 @@ mkPerson \n a e -> do
   email <- refine (e : Text)
   yield {name name age age email email}
 
-api (serve Api where
+api (< Api
   CreateUser = \{name name age age email email} ->
     case mkPerson name age email of
       Result.Ok {value person} -> do
@@ -2093,7 +2093,7 @@ resolve \title owner msg -> do
       Bool.True {} -> (base.unify t {status (Status.Resolved {resolution msg})})
       Bool.False {} -> t)
 
-api (serve Api where
+api (< Api
   GetTodos = \{user user} -> do
     todos <- pendingFor user
     yield (Result.Ok {value todos})

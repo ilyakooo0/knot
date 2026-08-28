@@ -628,7 +628,6 @@ impl Parser {
             | TokenKind::Full
             | TokenKind::Atomic
             | TokenKind::With
-            | TokenKind::Serve
             | TokenKind::Refine
             | TokenKind::Forall => {
                 let kw = format!("{:?}", self.peek()).to_lowercase();
@@ -1358,7 +1357,10 @@ impl Parser {
             TokenKind::Backslash => self.parse_lambda(),
             TokenKind::Match => self.parse_case(),
             TokenKind::Do => self.parse_do_expr(),
-            TokenKind::Serve => self.parse_serve_expr(),
+            // `< Api` opens a serve block. `<` in atom position is unambiguous:
+            // a comparison `a < b` has a left operand, so a leading `<` is
+            // never the less-than operator.
+            TokenKind::Lt => self.parse_serve_expr(),
             TokenKind::StarIdent(_) => {
                 // `*name = expr` is a set expression; otherwise just an
                 // ordinary source-ref expression handled by Pratt parsing.
@@ -2266,7 +2268,7 @@ impl Parser {
                 ))
             }
             TokenKind::Do => self.parse_do_expr(),
-            TokenKind::Serve => self.parse_serve_expr(),
+            TokenKind::Lt => self.parse_serve_expr(),
             TokenKind::LBrace => {
                 self.advance();
                 self.delimiter_depth += 1;
@@ -3203,15 +3205,12 @@ impl Parser {
             return None;
         }
         let result = self.in_context("serve expression", |this| {
-            this.advance(); // consume `serve`
+            // Consume the serve marker: `>` (the keyword `serve` is gone).
+            this.advance();
             let api_span = this.span();
             let api = this.parse_route_component_path()?;
             this.skip_newlines();
-            this.expect(
-                &TokenKind::Where,
-                "expected 'where' after API name in 'serve'",
-            )
-            .ok()?;
+            // No `where`: the indented handler block is the delimiter.
             let handlers = this.parse_block(|p| p.parse_serve_handler());
             let end = this.prev_span();
             Some(Spanned::new(

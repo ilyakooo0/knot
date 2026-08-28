@@ -396,3 +396,56 @@ Rel V1  *people
     let out2 = build_and_run(&dir, "mig_revert", committed);
     assert_eq!(out2, out1, "second run is idempotent");
 }
+
+/// A pending migration whose transform panics runs on a FORK, so the main DB
+/// is byte-identical afterward, and the run exits non-zero rather than
+/// aborting. (The transform panic crosses the generated-code boundary into the
+/// migration's savepoint rollback.)
+#[test]
+fn migrate_pending_panicking_transform_leaves_main_untouched() {
+    let dir = dir_for("mig_panic");
+    build_and_run(&dir, "mig_panic", V1);
+    lock_in_dir(dir.path(), "mig_panic");
+    let main_before = std::fs::read(dir.join("mig_panic.db")).unwrap();
+
+    // Pending migration whose transform panics on the real data (the match has
+    // no arm for "Alice").
+    let panicking = r#"with {
+Active  Yes {}  No {}
+PersonV1  {name Text}
+PersonV2  {name Text  active Active}
+Rel PersonV2  *people
+  \p -> (? (p.name)
+    "Nobody"  {name p.name  active (Active.Yes {})})
+}
+(|
+  yield {})"#;
+    std::fs::write(dir.join("mig_panic.knot"), panicking).unwrap();
+    let build = std::process::Command::new(knot_bin())
+        .arg("build")
+        .arg(dir.join("mig_panic.knot"))
+        .arg("-o")
+        .arg(dir.join("mig_panic"))
+        .current_dir(dir.path())
+        .output()
+        .expect("build");
+    assert!(build.status.success(), "the panicking transform compiles: {}", String::from_utf8_lossy(&build.stderr));
+
+    let run = std::process::Command::new(dir.join("mig_panic"))
+        .current_dir(dir.path())
+        .output()
+        .expect("run");
+    // The transform panic unwinds into the runtime's catch on the program
+    // thread and exits 101 — a clean failure, NOT an abort (134/SIGABRT).
+    assert_eq!(
+        run.status.code(),
+        Some(101),
+        "a panicking transform must exit cleanly (101), not abort"
+    );
+    assert_eq!(
+        std::fs::read(dir.join("mig_panic.db")).unwrap(),
+        main_before,
+        "a panicking pending migration runs on a fork — the main DB is byte-identical"
+    );
+}
+

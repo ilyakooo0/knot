@@ -13657,6 +13657,90 @@ pub extern "C-unwind" fn knot_migrate_group_end(db: *mut c_void) {
         .expect("knot runtime: failed to release group migration savepoint");
 }
 
+/// Run the program's `knot_user_main` under a `catch_unwind` so a panic in
+/// generated code on the MAIN thread lands in a Rust frame instead of
+/// aborting. Worker threads get this boundary from `std::thread`; the main
+/// thread does not — the JIT'd C `main` is the process entry, so a panic in
+/// the body has no Rust frame to unwind into and dies with "failed to initiate
+/// panic". This wrapper is that frame. On a caught panic it prints the message
+/// and exits non-zero (the default panic hook would otherwise never get a clean
+/// exit path).
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_run_user_main(
+    db: *mut c_void,
+    main_fn: *const c_void,
+) -> *mut c_void {
+    let f: extern "C-unwind" fn(*mut c_void) -> *mut c_void =
+        unsafe { std::mem::transmute(main_fn) };
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(db))) {
+        Ok(v) => v,
+        Err(payload) => {
+            // Roll back the group migration savepoint if one is open (the panic
+            // happened mid-migration), so the DB is unchanged. No-op when the
+            // panic is in the body (after the group released) — the rollback
+            // errors and is ignored, then we report the panic.
+            let db_ref = unsafe { &*(db as *const KnotDb) };
+            let _ = db_ref.conn.execute_batch(
+                "ROLLBACK TO SAVEPOINT knot_migrate_all; RELEASE SAVEPOINT knot_migrate_all;",
+            );
+            let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+                s.to_string()
+            } else if let Some(s) = payload.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "unknown panic".to_string()
+            };
+            eprintln!("knot: {msg}");
+            std::process::exit(101);
+        }
+    }
+}
+
+// ── Process entry ────────────────────────────────────────────────
+
+/// Run the program's entry (`knot_program_main`) on a worker thread under
+/// `catch_unwind`, returning the process exit code. The generated `main`
+/// delegates to this so a panic in generated code (the migration prologue
+/// included) unwinds into the worker's Rust frame — printing the message and
+/// exiting 101 — instead of aborting the main thread ("failed to initiate
+/// panic"). Worker threads get an unwind boundary from `std::thread`; the main
+/// thread does not, which is why a top-level panic used to abort. This lives in
+/// the runtime (not as a `main` symbol) so host binaries that link the runtime
+/// don't collide on `main`.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_run_program_main(
+    main_fn: *const c_void,
+    argc: i32,
+    argv: *const c_void,
+) -> i32 {
+    let f: extern "C-unwind" fn(i32, *const c_void) -> i32 =
+        unsafe { std::mem::transmute(main_fn) };
+    // Raw pointers aren't Send; carry them as usizes across the spawn.
+    let argv_addr = argv as usize;
+    let result = std::thread::Builder::new()
+        .spawn(move || std::panic::catch_unwind(|| f(argc, argv_addr as *const c_void)))
+        .expect("knot runtime: failed to spawn the program thread")
+        .join();
+    match result {
+        Ok(Ok(code)) => code,
+        Ok(Err(payload)) => {
+            let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+                s.to_string()
+            } else if let Some(s) = payload.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "unknown panic".to_string()
+            };
+            eprintln!("knot: {msg}");
+            101
+        }
+        Err(_) => {
+            eprintln!("knot: program thread panicked");
+            101
+        }
+    }
+}
+
 /// Compute a source's migrated rows *without* persisting them, so the compiler
 /// can run refinement validation on the transformed data before the
 /// destructive `knot_source_migrate` write (mirroring the set/replace/view

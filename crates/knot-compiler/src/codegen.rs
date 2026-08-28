@@ -1641,6 +1641,11 @@ impl<M: cranelift_module::Module> Codegen<M> {
         // failure in any one source rolls all of them back.
         self.declare_rt("knot_migrate_group_begin", &[p], &[]);
         self.declare_rt("knot_migrate_group_end", &[p], &[]);
+        // Runs knot_user_main under a catch_unwind boundary on the main thread.
+        self.declare_rt("knot_run_user_main", &[p, p], &[p]);
+        // Runs the whole program (knot_program_main) on a worker thread under
+        // catch_unwind, returning the process exit code (101 on a caught panic).
+        self.declare_rt("knot_run_program_main", &[p, types::I32, p], &[types::I32]);
         self.declare_rt(
             "knot_source_migrate_preview",
             &[p, p, p, p, p, p, p, p],
@@ -4141,9 +4146,14 @@ impl<M: cranelift_module::Module> Codegen<M> {
         sig.params.push(AbiParam::new(types::I32)); // argc
         sig.params.push(AbiParam::new(self.ptr_type)); // argv
         sig.returns.push(AbiParam::new(types::I32));
+        // The generated entry is NOT named `main`: the runtime provides the real
+        // C `main` (`knot_main`), which runs this on a worker thread under a
+        // `catch_unwind` so a panic anywhere in generated code (migration
+        // prologue included) unwinds into a Rust frame and exits cleanly,
+        // instead of aborting the main thread. See `knot_main`.
         let main_id = self
             .module
-            .declare_function("main", Linkage::Export, &sig)
+            .declare_function("knot_program_main", Linkage::Export, &sig)
             .unwrap();
 
         let decls = decl_views(program);
@@ -4681,9 +4691,17 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 if n_params == 0 {
                     cg.call_rt_void(builder, "knot_arena_push_frame", &[]);
 
+                    // Run `knot_user_main` via the runtime's catching wrapper, so a
+                    // panic in the body on the MAIN thread lands in a Rust
+                    // `catch_unwind` frame (rolling back the group migration
+                    // savepoint) instead of aborting — see `knot_run_user_main`.
                     let user_main_ref = cg.module.declare_func_in_func(main_fn_id, builder.func);
-                    let call = builder.ins().call(user_main_ref, &[db]);
-                    let result = builder.inst_results(call)[0];
+                    let main_addr = builder.ins().func_addr(cg.ptr_type, user_main_ref);
+                    let result = cg.call_rt(
+                        builder,
+                        "knot_run_user_main",
+                        &[db, main_addr],
+                    );
 
                     // Run IO if result is an IO value, then print
                     let io_run_ref = cg.import_rt(builder, "knot_io_run");
@@ -4714,6 +4732,32 @@ impl<M: cranelift_module::Module> Codegen<M> {
 
             let zero = builder.ins().iconst(types::I32, 0);
             builder.ins().return_(&[zero]);
+        });
+
+        // Emit the real C `main`: a thin wrapper that runs `knot_program_main`
+        // (the body built above) on a worker thread under `catch_unwind` via the
+        // runtime's `knot_run_program_main`. A panic anywhere in the program —
+        // including the migration prologue — then unwinds into a Rust frame and
+        // exits 101 instead of aborting the main thread.
+        let mut m2sig = self.module.make_signature();
+        m2sig.params.push(AbiParam::new(types::I32)); // argc
+        m2sig.params.push(AbiParam::new(self.ptr_type)); // argv
+        m2sig.returns.push(AbiParam::new(types::I32));
+        let real_main_id = self
+            .module
+            .declare_function("main", Linkage::Export, &m2sig)
+            .unwrap();
+        self.build_function(real_main_id, m2sig, |cg, builder, entry| {
+            let argc = builder.block_params(entry)[0];
+            let argv = builder.block_params(entry)[1];
+            let prog_ref = cg.module.declare_func_in_func(main_id, builder.func);
+            let prog_addr = builder.ins().func_addr(cg.ptr_type, prog_ref);
+            let code = cg.call_rt(
+                builder,
+                "knot_run_program_main",
+                &[prog_addr, argc, argv],
+            );
+            builder.ins().return_(&[code]);
         });
     }
 

@@ -10,9 +10,9 @@ use e2e::assert_stdout;
 fn encrypt_decrypt_roundtrip() {
     assert_stdout(
         "crypto_rt",
-        r#"(do
+        r#"(|
   keys <- base.generateKeyPair
-  with {  msg (base.textToBytes "secret") } (do
+  with {  msg (base.textToBytes "secret") } (|
     enc <- base.encrypt keys.publicKey msg
     ? (enc)
       Maybe.Nothing {}  base.println "ENCRYPT-FAILED"
@@ -30,13 +30,13 @@ fn encrypt_decrypt_roundtrip() {
 fn decrypt_rejects_tampered_ciphertext() {
     assert_stdout(
         "crypto_tamper",
-        r#"(do
+        r#"(|
   keys <- base.generateKeyPair
   enc <- base.encrypt keys.publicKey (base.textToBytes "data")
   ? (enc)
     Maybe.Nothing {}  base.println "ENCRYPT-FAILED"
     Maybe.Just {value ct}
-      with {  tampered (base.bytesConcat (base.bytesSlice 0 40 ct) (base.textToBytes "XXXX")) } (do
+      with {  tampered (base.bytesConcat (base.bytesSlice 0 40 ct) (base.textToBytes "XXXX")) } (|
         ? (base.decrypt keys.privateKey tampered)
           Maybe.Nothing {}  base.println "rejected"
           Maybe.Just {value _}  base.println "BUG-DECRYPTED"
@@ -50,7 +50,7 @@ fn decrypt_rejects_tampered_ciphertext() {
 fn decrypt_with_wrong_key_fails() {
     assert_stdout(
         "crypto_wrongkey",
-        r#"(do
+        r#"(|
   alice <- base.generateKeyPair
   bob <- base.generateKeyPair
   enc <- base.encrypt alice.publicKey (base.textToBytes "for alice")
@@ -68,13 +68,13 @@ fn decrypt_with_wrong_key_fails() {
 fn sign_verify_roundtrip() {
     assert_stdout(
         "crypto_sign",
-        r#"(do
+        r#"(|
   keys <- base.generateSigningKeyPair
-  with {  msg (base.textToBytes "message") } (do
+  with {  msg (base.textToBytes "message") } (|
     ? (base.sign keys.privateKey msg)
       Maybe.Nothing {}  base.println "SIGN-FAILED"
       Maybe.Just {value sig}
-        with {  ok (base.verify keys.publicKey msg sig) } (do
+        with {  ok (base.verify keys.publicKey msg sig) } (|
           base.println (base.show ok)
           yield {})
     yield {}))"#,
@@ -86,12 +86,12 @@ fn sign_verify_roundtrip() {
 fn verify_rejects_wrong_message() {
     assert_stdout(
         "crypto_verifybad",
-        r#"(do
+        r#"(|
   keys <- base.generateSigningKeyPair
   ? (base.sign keys.privateKey (base.textToBytes "original"))
     Maybe.Nothing {}  base.println "SIGN-FAILED"
     Maybe.Just {value sig}
-      with {  bad (base.verify keys.publicKey (base.textToBytes "forged") sig) } (do
+      with {  bad (base.verify keys.publicKey (base.textToBytes "forged") sig) } (|
         base.println (base.show bad)
         yield {})
   yield {})"#,
@@ -103,7 +103,7 @@ fn verify_rejects_wrong_message() {
 fn key_lengths_are_32_bytes() {
     assert_stdout(
         "crypto_keylen",
-        r#"(do
+        r#"(|
   enc <- base.generateKeyPair
   sig <- base.generateSigningKeyPair
   base.println (base.show (base.bytesLength enc.publicKey))

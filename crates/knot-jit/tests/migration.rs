@@ -41,7 +41,7 @@ Active  Yes {}  No {}
 PersonV1  {name Text}
 Rel PersonV1  *people
 }
-(do
+(|
   full *people = [{name "Alice"}]
   yield {})"#;
 
@@ -52,7 +52,7 @@ PersonV2  {name Text  active Active}
 Rel PersonV2  *people
   \p -> {name p.name  active (Active.Yes {})}
 }
-(do
+(|
   rows <- *people
   base.println (base.show rows)
   yield {})"#;
@@ -147,7 +147,7 @@ Active  Yes {}  No {}
 PersonV2  {name Text  active Active}
 Rel PersonV2  *people
 }
-(do
+(|
   yield {})"#;
     std::fs::write(dir.join("mig_drift.knot"), no_block).unwrap();
     let build = std::process::Command::new(knot_bin())
@@ -201,7 +201,7 @@ PersonV2  {name Text  active Active}
 Rel PersonV2  *people
   \p -> {wrongfield p.name}
 }
-(do
+(|
   yield {})"#;
     std::fs::write(dir.join("mig_using.knot"), bad_using).unwrap();
     let build = std::process::Command::new(knot_bin())
@@ -229,7 +229,7 @@ PersonV2  {name Text  active Active}
 Rel PersonV2  *people
   \p -> {name p.nonexistent  active (Active.Yes {})}
 }
-(do
+(|
   yield {})"#;
     std::fs::write(dir.join("mig_using.knot"), bad_read).unwrap();
     let build = std::process::Command::new(knot_bin())
@@ -263,7 +263,7 @@ PersonV1  {name Text}
 PersonV2  {name Text  active Active}
 Rel PersonV2  *people
 }
-(do
+(|
   yield {})"#;
     std::fs::write(dir.join("mig_dangle.knot"), deleted).unwrap();
     let build = std::process::Command::new(knot_bin())
@@ -303,7 +303,7 @@ Rel V3  *people
   \p -> {name p.name  active "yes"}
   \p -> {name p.name  active p.active  extra "x"}
 }
-(do
+(|
   yield {})"#;
     std::fs::write(dir.join("mig_two_pending.knot"), two).unwrap();
 
@@ -347,7 +347,7 @@ fn migrate_revert_chain_is_idempotent() {
 V1  {name Text}
 Rel V1  *people
 }
-(do
+(|
   full *people = [{name "alice"}  {name "bob"}]
   rows <- *people
   base.println (base.show rows)
@@ -363,7 +363,7 @@ V2  {name Text  active Text}
 Rel V2  *people
   \p -> {name p.name  active "UP"}
 }
-(do
+(|
   yield {})"#;
     build_and_run(&dir, "mig_revert", v2);
     lock_in_dir(dir.path(), "mig_revert");
@@ -375,7 +375,7 @@ V2  {name Text  active Text}
 Rel V1  *people
   \p -> {name p.name}
 }
-(do
+(|
   yield {})"#;
     build_and_run(&dir, "mig_revert", v1_revert);
     lock_in_dir(dir.path(), "mig_revert");
@@ -387,7 +387,7 @@ V1  {name Text}
 V2  {name Text  active Text}
 Rel V1  *people
 }
-(do
+(|
   rows <- *people
   base.println (base.show rows)
   yield {})"#;

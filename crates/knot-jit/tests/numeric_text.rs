@@ -83,7 +83,7 @@ fn trim_full_unicode() {
 
 #[test]
 fn distinct_dedups() {
-    // distinct preserves first-occurrence order (does not sort)
+    // distinct preserves first-occurrence order (|es not sort)
     assert_show("base.distinct [3  1  3  2  1]", "[3, 1, 2]");
     assert_show("base.distinct [1  1  1]", "[1]");
     assert_show("base.distinct []", "[]");

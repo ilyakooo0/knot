@@ -1,4 +1,4 @@
-(do
+(|
   -- Encode values to JSON
   base.println (base.toJson 42)
   base.println (base.toJson 3.14)
@@ -9,12 +9,12 @@
   base.println (base.toJson {  name "Alice"  age 30 })
 
   -- Encode a relation (becomes JSON array)
-  with {  nums [{  x 1 }  {  x 2 }  {  x 3 }] } (do
+  with {  nums [{  x 1 }  {  x 2 }  {  x 3 }] } (|
     base.println (base.toJson nums)
 
     -- Round-trip: encode then decode. parseJson returns `Maybe a` so malformed
     -- input is recoverable rather than fatal — match on the result.
-    with {  json (base.toJson {  x 10  y 20 }) } (do
+    with {  json (base.toJson {  x 10  y 20 }) } (|
       base.println json
       ? (base.the (Maybe {x (Int 1)  y (Int 1)}) (base.parseJson json))
         Maybe.Just {  value value }  base.println (base.show value)

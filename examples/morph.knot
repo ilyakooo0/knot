@@ -37,7 +37,7 @@ Text  argText  (with conv ((^into) 41))     -- Int  arg,  wants Text
 Int 1  asInt  (with conv ((^into) "hi"))   --  wants Int 1   ->  morph.text.int.into
 Float 1  asFloat  (with conv ((^into) "hi"))   --  wants Float 1 ->  morph.text.float.into
 }
-(do
+(|
   base.println (base.show argInt)    -- "2"   (length of "hi")
   base.println (base.show argText)   -- "41"
   base.println (base.show asInt)     -- "2"

@@ -7,25 +7,25 @@ Item  {name Text  price (Int 1)}
 Rel Item  *items
 
 -- Append `union  items new`  hidden behind  a with.
-appendDemo (do
+appendDemo (|
   items <- *items
   with {extra [{name "Charlie"  price 30}]} with {merged (base.union items extra)} *items = merged)
 
 -- Conditional  update do-block  update body  bound to  a with.
-discountDemo (do
+discountDemo (|
   items <- *items
-  with {discounted (do
+  with {discounted (|
     i <- items
     yield (? (i.price > 20)
       Bool.True {}  (base.unify i {price (i.price - 5)})
       Bool.False {}  i))} *items = discounted)
 
 -- Filter  only do-block  filter body  bound to  a with.
-pruneDemo (do
+pruneDemo (|
   items <- *items
-  with {kept (do i <- items; where i.price > 0; yield i)} *items = kept)
+  with {kept (| i <- items; where i.price > 0; yield i)} *items = kept)
 }
-(do
+(|
   full *items = [{name "Alice"  price 10}  {name "Bob"  price 25}]
   appendDemo
   rows1 <- *items

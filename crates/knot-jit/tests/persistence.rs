@@ -13,9 +13,9 @@ fn persisted_relation_groupby() {
 Todo  {owner Text  done (Int 1)}
 Rel Todo  *todos
 }
-(do
+(|
   full *todos = [{owner "x"  done 0}  {owner "x"  done 1}  {owner "y"  done 0}]
-  groups <- (do
+  groups <- (|
     t <- *todos
     where t.done == 0
     groupBy {owner t.owner}
@@ -36,7 +36,7 @@ fn persisted_relation_read_write() {
 C  {n (Int 1)}
 Rel C  *cs
 }
-(do
+(|
   full *cs = [{n 1}  {n 2}  {n 3}]
   rows <- *cs
   base.println (base.show (base.count rows))
@@ -50,7 +50,7 @@ Rel C  *cs
 fn file_write_read_roundtrip() {
     assert_stdout(
         "fileio",
-        r#"(do
+        r#"(|
   base.writeFile "note.txt" "hello knot"
   content <- base.readFile "note.txt"
   base.println content
@@ -69,7 +69,7 @@ fn morph_resolution() {
 Maybe (Int 1)  asInt  ((^into) "42")
 Text  asText  ((^into) 7)
 }
-(do
+(|
   base.println (base.show asInt)
   base.println asText
   yield {})"#,
@@ -82,7 +82,7 @@ fn traverse_io() {
     // Only IO is a supported traverse applicative.
     assert_stdout(
         "traverse",
-        r#"(do
+        r#"(|
   r <- (base.traverse (\n -> base.println (base.show (n * 2))) [1  2])
   base.println (base.show r)
   yield {})"#,
@@ -125,7 +125,7 @@ fn compile_err_on_invalid_source() {
 
 #[test]
 fn atomic_transfer() {
-    // `atomic do ...` returns the relation written; bind it (or `_`) so the
+    // `atomic | ...` returns the relation written; bind it (or `_`) so the
     // enclosing do-block's value isn't the relation.
     assert_stdout(
         "atomic",
@@ -133,9 +133,9 @@ fn atomic_transfer() {
 Account  {name Text  balance (Int 1)}
 Rel Account  *accounts
 }
-(do
+(|
   full *accounts = [{name "from"  balance 100}  {name "to"  balance 0}]
-  _ <- atomic do
+  _ <- atomic |
     rows <- *accounts
     *accounts = base.map (\a ->
       ? (a.name == "from")
@@ -163,7 +163,7 @@ fn persisted_adt_element_source() {
 Shape  Circle {radius (Int 1)}  Square {side (Int 1)}  Point {}
 Rel Shape  *shapes
 }
-(do
+(|
   full *shapes = [Shape.Circle {radius 3}  Shape.Square {side 2}  Shape.Point {}]
   rows <- *shapes
   base.println (base.show rows)
@@ -189,7 +189,7 @@ Shape  Circle {radius (Int 1)}  Square {side (Int 1)}  Point {}
 Entry  {name Text  sh Shape}
 Rel Entry  *es
 }
-(do
+(|
   full *es = [{name "a"  sh (Shape.Circle {radius 3})}  {name "b"  sh (Shape.Point {})}]
   rows <- *es
   base.println (base.show rows)
@@ -211,7 +211,7 @@ Shape  Circle {radius (Int 1)}  Point {}
 Entry  {name Text  sh Shape}
 Rel Entry  *es
 }
-(do
+(|
   full *es = [{name "a"  sh (Shape.Circle {radius 3})}  {name "b"  sh (Shape.Circle {radius 3})}  {name "c"  sh (Shape.Point {})}]
   yield {})"#,
         dir.path(),
@@ -249,7 +249,7 @@ fn persisted_record_field_is_content_addressed() {
 Entry  {name Text  addr {city Text  zip (Int 1)}}
 Rel Entry  *es
 }
-(do
+(|
   full *es = [{name "a"  addr {city "paris"  zip 75001}}]
   yield {})"#,
         dir.path(),
@@ -286,7 +286,7 @@ fn persisted_scalar_relation_field_is_child_table() {
 Entry  {name Text  tags (Rel Text)}
 Rel Entry  *es
 }
-(do
+(|
   full *es = [{name "a"  tags ["x"  "y"]}  {name "b"  tags ["y"  "z"]}]
   yield {})"#,
         dir.path(),
@@ -333,7 +333,7 @@ Shape  Circle {tags (Rel Tag)  radius (Int 1)}  Point {}
 Entry  {name Text  sh Shape}
 Rel Entry  *es
 }
-(do
+(|
   full *es = [{name "a"  sh (Shape.Circle {tags [{value "x"}  {value "y"}]  radius 5})}]
   rows <- *es
   base.println (base.show rows)
@@ -352,7 +352,7 @@ Shape  Circle {tags (Rel Tag)  radius (Int 1)}  Point {}
 Entry  {name Text  sh Shape}
 Rel Entry  *es
 }
-(do
+(|
   full *es = [{name "a"  sh (Shape.Circle {tags [{value "x"}]  radius 5})}]
   yield {})"#,
         dir.path(),
@@ -393,7 +393,7 @@ fn persisted_relation_of_relations_round_trips() {
 Entry  {name Text  grid (Rel (Rel (Int 1)))}
 Rel Entry  *es
 }
-(do
+(|
   full *es = [{name "a"  grid [[1  2]  [3]]}]
   rows <- *es
   base.println (base.show rows)
@@ -415,7 +415,7 @@ Shape  Circle {radius (Int 1)}  Point {}
 Entry  {name Text  sh Shape}
 Rel Entry  *es
 }
-(do
+(|
   full *es = [{name "a"  sh (Shape.Circle {radius 3})}]
   yield {})"#,
         dir.path(),
@@ -453,7 +453,7 @@ Shape  Circle {radius (Int 1)}  Point {}
 Entry  {name Text  sh Shape}
 Rel Entry  *es
 }
-(do
+(|
   full *es = [{name "a"  sh (Shape.Circle {radius 3})}]
   full *es = [{name "b"  sh (Shape.Point {})}]
   yield {})"#,
@@ -490,7 +490,7 @@ fn int_column_is_native_integer() {
 C  {n (Int 1)}
 Rel C  *cs
 }
-(do
+(|
   full *cs = [{n 42}]
   yield {})"#,
         dir.path(),
@@ -529,7 +529,7 @@ fn function_field_is_a_compile_error() {
 R  {name Text  f (Int 1 -> Int 1)}
 Rel R  *rs
 }
-(do
+(|
   full *rs = [{name "x"  f (\n -> n + 1)}]
   yield {})"#;
     let src_path = dir.join("fnfield.knot");
@@ -564,7 +564,7 @@ S  Wrap {g (Int 1 -> Int 1)}  Nope {}
 R  {name Text  f S}
 Rel R  *rs
 }
-(do
+(|
   full *rs = [{name "x"  f (S.Wrap {g (\n -> n)})}]
   yield {})"#;
     let src_path = dir.join("fnadt.knot");
@@ -602,7 +602,7 @@ fn int_sum_overflow_panics_cleanly() {
 E  {n (Int 1)}
 Rel E  *emps
 }
-(do
+(|
   full *emps = [{n 9223372036854775807}  {n 1}]
   base.println (base.show (*emps |> base.map (\e -> e.n) |> base.sum))
   yield {})"#,

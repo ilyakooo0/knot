@@ -20,7 +20,7 @@ fn assert_stdout_unordered(name: &str, src: &str, expected: &[&str]) {
 fn fork_runs_concurrently() {
     assert_stdout_unordered(
         "fork",
-        r#"(do
+        r#"(|
   base.fork (base.println "from fork")
   base.println "from main"
   base.sleep 200
@@ -36,9 +36,9 @@ fn race_returns_winner() {
     // surfaces as Result.Ok. Deterministic (fast never sleeps).
     assert_stdout(
         "race",
-        r#"(do
+        r#"(|
   winner <- base.race
-    (do
+    (|
       base.sleep 200
       base.println "slow"
       yield {})
@@ -53,7 +53,7 @@ fn race_returns_winner() {
 fn sleep_pauses() {
     assert_stdout(
         "sleep",
-        r#"(do
+        r#"(|
   base.println "a"
   base.sleep 50
   base.println "b"
@@ -77,9 +77,9 @@ fn fork_atomic_panic_is_caught_on_worker() {
 C  {n (Int 1)}
 Rel C  *cs
 }
-(do
+(|
   full *cs = [{n 1}]
-  base.fork (atomic do
+  base.fork (atomic |
     full *cs = [{n 2}]
     base.println (base.show (9223372036854775807 + 1))
     yield {})

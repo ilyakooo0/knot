@@ -1,7 +1,7 @@
 -- Test when/unless builtins.
-(do
+(|
   base.when (Bool.True {}) (base.println "when true: runs")
   base.when (Bool.False {}) (base.println "when false: skipped")
   base.unless (Bool.True {}) (base.println "unless true: skipped")
   base.unless (Bool.False {}) (base.println "unless false: runs")
-  with {n 5} (do base.when (n > 0) (do base.println "block action: n is positive"; base.println (base.show n)); base.unless (n > 100) (do base.println "block action: n <= 100"); yield {}))
+  with {n 5} (| base.when (n > 0) (| base.println "block action: n is positive"; base.println (base.show n)); base.unless (n > 100) (| base.println "block action: n <= 100"); yield {}))

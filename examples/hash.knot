@@ -1,6 +1,6 @@
 -- Hash builtin smoke-test (BLAKE3, polymorphic over any value)
 
-(do
+(|
   -- Bytes: BLAKE3 of "abc" — expected 6437b3ac...9d85
   base.println (base.bytesToHex (base.hash (base.textToBytes "abc")))
 

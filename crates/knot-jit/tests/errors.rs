@@ -10,7 +10,7 @@ fn result_do_block_all_ok() {
     assert_show(
         "with {
 Int 1 -> Result Text (Int 1)  f  (\\x -> Result.Ok {value (x + 1)}) }
-         (? (do
+         (? (|
             a <- f 1
             b <- f a
             yield b)
@@ -28,7 +28,7 @@ fn result_do_block_short_circuits_on_err() {
 Int 1 -> Result Text (Int 1)  f  (\\x -> ? (x == 0)
                           Bool.True {}  Result.Err {error \"stop\"}
                           Bool.False {}  Result.Ok {value x}) }
-         (? (do
+         (? (|
             a <- f 0
             b <- f a
             yield b)
@@ -45,7 +45,7 @@ fn maybe_bind_short_circuits_on_nothing() {
 Int 1 -> Maybe (Int 1)  f  (\\x -> ? (x == 0)
                           Bool.True {}  Maybe.Nothing {}
                           Bool.False {}  Maybe.Just {value x}) }
-         (? (do
+         (? (|
             a <- f 0
             b <- f a
             yield b)
@@ -62,7 +62,7 @@ fn error_is_structured_log_not_abort() {
     let dir = e2e::TempDir::fresh("err_log");
     e2e::build_in_dir(
         "err_log",
-        r#"(do
+        r#"(|
   base.println "before"
   base.error "boom"
   base.println "after"
@@ -90,7 +90,7 @@ fn todo_aborts_process() {
     let dir = e2e::TempDir::fresh("todo_abort");
     e2e::build_in_dir(
         "todo_abort",
-        r#"(do
+        r#"(|
   base.println "start"
   base.println base.todo
   yield {})"#,

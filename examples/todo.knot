@@ -3,13 +3,13 @@ Todo  {title Text  owner Text  done (Int 1)}
 
 Rel Todo  *todos
 
-_  add  (\title owner -> do
+_  add  (\title owner -> |
   todos <- *todos
   *todos = base.union todos [{title title  owner owner  done 0}])
 
-_  complete  (\title -> do
+_  complete  (\title -> |
   todos <- *todos
-  *todos = do
+  *todos = |
     t <- todos
     yield (? (t.title == title)
       Bool.True {}  (base.unify t {done 1})
@@ -17,9 +17,9 @@ _  complete  (\title -> do
 
 _  pending  (\owner ->
   with {todos *todos}
-  (do t <- todos; where t.done == 0; where t.owner == owner; yield t.title))
+  (| t <- todos; where t.done == 0; where t.owner == owner; yield t.title))
 }
-(do
+(|
   add "Write parser" "Alice"
   add "Write codegen" "Alice"
   add "Write runtime" "Bob"

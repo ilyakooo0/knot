@@ -62,7 +62,7 @@ fn bool_case_exhaustive() {
 #[test]
 fn comprehension_cross_product() {
     assert_show(
-        "base.sortBy (\\p -> p) (do
+        "base.sortBy (\\p -> p) (|
            a <- [1  2]
            b <- [10  20]
            yield (a + b))",
@@ -74,7 +74,7 @@ fn comprehension_cross_product() {
 fn comprehension_equi_join() {
     // join employees to departments on a shared key
     assert_show(
-        "with {\n           emps [{name \"a\"  dept \"eng\"}  {name \"b\"  dept \"ops\"}  {name \"c\"  dept \"eng\"}]\n           depts [{dname \"eng\"  floor 3}  {dname \"ops\"  floor 1}]\n         }\n         (base.sortBy (\\r -> r.name) (do\n            e <- emps\n            d <- depts\n            where e.dept == d.dname\n            yield {name e.name  floor d.floor}))",
+        "with {\n           emps [{name \"a\"  dept \"eng\"}  {name \"b\"  dept \"ops\"}  {name \"c\"  dept \"eng\"}]\n           depts [{dname \"eng\"  floor 3}  {dname \"ops\"  floor 1}]\n         }\n         (base.sortBy (\\r -> r.name) (|\n            e <- emps\n            d <- depts\n            where e.dept == d.dname\n            yield {name e.name  floor d.floor}))",
         "[{floor 3  name a}, {floor 1  name b}, {floor 3  name c}]",
     );
 }
@@ -82,7 +82,7 @@ fn comprehension_equi_join() {
 #[test]
 fn comprehension_with_let_and_where() {
     assert_show(
-        "(do
+        "(|
            x <- [1  2  3  4  5]
            where x % 2 == 0
            yield (x * 10))",
@@ -94,7 +94,7 @@ fn comprehension_with_let_and_where() {
 fn comprehension_nested_yield_relation() {
     // flatMap: each element expands to a sub-relation
     assert_show(
-        "(do
+        "(|
            n <- [1  2  3]
            m <- [n  (n * 10)]
            yield m)",

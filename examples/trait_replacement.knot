@@ -13,7 +13,7 @@ textRender {render (\s -> "text:" ++ s)}
 -- "Multiple constraints"  is just  a record with  several fields.
 greeter {greet (\n -> "hi " ++ base.show n)  farewell (\n -> "bye " ++ base.show n)}
 }
-(do
+(|
   -- `^render` resolves to whichever dictionary is lexically in scope.
   with intRender (base.println ((^render) 41))         -- intRender's render
   with textRender (base.println ((^render) "hello"))   -- textRender's render

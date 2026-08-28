@@ -1,6 +1,6 @@
 -- Test forEach builtin.
 
-(do
+(|
   -- Basic case: print each integer
   base.forEach [1  2  3] (\x -> base.println (base.show x))
   -- Empty list: action shouldn't run

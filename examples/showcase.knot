@@ -51,7 +51,7 @@ Rel Metric  *metrics
 
 -- ── Seed  data ────────────────────────────────────────────────────
 
-seedEmployees (do
+seedEmployees (|
   full *employees = [
     {name "Alice Chen"  age 34  salary 142000.0  dept (Department.Engineering {})  active (Active.Yes {})} 
     {name "Bob Martinez"  age 28  salary 95000.0  dept (Department.Engineering {})  active (Active.Yes {})} 
@@ -76,7 +76,7 @@ seedEmployees (do
   ]
   yield {})
 
-seedProjects (do
+seedProjects (|
   full *projects = [
     {name "Phoenix"  lead "Alice Chen"  budget 500000.0  priority (Priority.Critical {})} 
     {name "Atlas"  lead "Carol Davis"  budget 350000.0  priority (Priority.High {})} 
@@ -89,7 +89,7 @@ seedProjects (do
   ]
   yield {})
 
-seedTickets (do
+seedTickets (|
   full *tickets = [
     {
       title "Fix auth timeout"
@@ -185,7 +185,7 @@ seedTickets (do
   ]
   yield {})
 
-seedCustomers (do
+seedCustomers (|
   full *customers = [
     {name "Acme Corp"  email "admin@acme.com"  tier (Tier.Enterprise {})} 
     {name "Widgets Inc"  email "hello@widgets.io"  tier (Tier.Pro {})} 
@@ -202,7 +202,7 @@ seedCustomers (do
   ]
   yield {})
 
-seedProducts (do
+seedProducts (|
   full *products = [
     {name "Laptop Pro 16"  price 2499.99  category (Category.Electronics {})  inStock (Active.Yes {})} 
     {name "Wireless Mouse"  price 49.99  category (Category.Electronics {})  inStock (Active.Yes {})} 
@@ -222,7 +222,7 @@ seedProducts (do
   ]
   yield {})
 
-seedOrders (do
+seedOrders (|
   full *orders = [
     {customer "Acme Corp"  product "Laptop Pro 16"  quantity 50  total 124999.5} 
     {customer "Acme Corp"  product "4K Monitor"  quantity 50  total 29999.5} 
@@ -252,7 +252,7 @@ seedOrders (do
   ]
   yield {})
 
-seedTeams (do
+seedTeams (|
   full *teams = [
     {
       name "Platform"
@@ -296,7 +296,7 @@ seedTeams (do
   ]
   yield {})
 
-seedLogs (do
+seedLogs (|
   full *logs = [
     {timestamp 1710900000  level (Level.Info {})  message "Server started on port 8080"  source "main"} 
     {
@@ -406,7 +406,7 @@ seedLogs (do
   ]
   yield {})
 
-seedMetrics (do
+seedMetrics (|
   full *metrics = [
     {name "http_requests_total"  value 48291.0  tags "method=GET,status=200"} 
     {name "http_requests_total"  value 12847.0  tags "method=POST,status=201"} 
@@ -443,7 +443,7 @@ seedMetrics (do
 -- ── Main ─────────────────────────────────────────────────────────
 
 }
-(do
+(|
   seedEmployees
   seedProjects
   seedTickets

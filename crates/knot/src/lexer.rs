@@ -21,7 +21,6 @@ pub enum TokenKind {
 
     // Keywords
     Where,
-    Do,
     Not,
     Full,
     Atomic,
@@ -103,7 +102,6 @@ impl TokenKind {
             TokenKind::Lower(_) => "identifier",
             TokenKind::Upper(_) => "type name",
             TokenKind::Where => "'where'",
-            TokenKind::Do => "'do'",
             TokenKind::Not => "'not'",
             TokenKind::Full => "'full'",
             TokenKind::Atomic => "'atomic'",
@@ -159,7 +157,6 @@ impl TokenKind {
     pub fn keyword_str(&self) -> Option<&'static str> {
         match self {
             TokenKind::Where => Some("where"),
-            TokenKind::Do => Some("do"),
             TokenKind::Not => Some("not"),
             TokenKind::Full => Some("full"),
             TokenKind::Atomic => Some("atomic"),
@@ -548,7 +545,6 @@ impl<'src> Lexer<'src> {
         if first.is_ascii_lowercase() || first == b'_' {
             match text {
                 "where" => return TokenKind::Where,
-                "do" => return TokenKind::Do,
                 "not" => return TokenKind::Not,
                 "full" => return TokenKind::Full,
                 "atomic" => return TokenKind::Atomic,

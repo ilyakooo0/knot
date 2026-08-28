@@ -271,20 +271,20 @@ fn upsert_inserts() {
 #[test]
 fn comprehension_filter() {
     assert_show_set(
-        "(do\n  n <- [1  2  3  4  5]\n  where n % 2 == 0\n  yield n)",
+        "(|\n  n <- [1  2  3  4  5]\n  where n % 2 == 0\n  yield n)",
         &["2", "4"],
     );
 }
 
 #[test]
 fn comprehension_map() {
-    assert_show_set("(do\n  n <- [1  2  3]\n  yield (n * n))", &["1", "4", "9"]);
+    assert_show_set("(|\n  n <- [1  2  3]\n  yield (n * n))", &["1", "4", "9"]);
 }
 
 #[test]
 fn comprehension_join() {
     assert_show_set(
-        "(do\n  a <- [1  2]\n  b <- [10  20]\n  yield (a + b))",
+        "(|\n  a <- [1  2]\n  b <- [10  20]\n  yield (a + b))",
         &["11", "21", "12", "22"],
     );
 }

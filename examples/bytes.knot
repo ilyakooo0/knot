@@ -1,11 +1,11 @@
 -- ByteString example
 
-with {  raw (base.textToBytes "hello") } (do
+with {  raw (base.textToBytes "hello") } (|
   -- A Bytes value comes from a regular string via textToBytes
   base.println (base.bytesLength raw)        -- 5
 
   -- Convert text -> bytes (always succeeds)
-  with {  encoded (base.textToBytes "world") } (do
+  with {  encoded (base.textToBytes "world") } (|
     base.println (base.bytesLength encoded)    -- 5
 
     -- Convert bytes -> text — Maybe, returns Nothing on invalid UTF-8
@@ -14,7 +14,7 @@ with {  raw (base.textToBytes "hello") } (do
       Maybe.Nothing {}  base.println "<invalid utf-8>"
 
     -- Hex encoding always succeeds
-    with {  hex (base.bytesToHex raw) } (do
+    with {  hex (base.bytesToHex raw) } (|
       base.println hex                      -- 68656c6c6f
 
       -- Hex decoding is Maybe — returns Nothing on odd-length / non-hex input
@@ -25,11 +25,11 @@ with {  raw (base.textToBytes "hello") } (do
         Maybe.Nothing {}  base.println "<invalid hex>"
 
       -- Concatenation
-      with {  combined (base.bytesConcat raw encoded) } (do
+      with {  combined (base.bytesConcat raw encoded) } (|
         base.println (base.bytesLength combined)   -- 10
 
         -- Slicing
-        with {  slice (base.bytesSlice 0 5 combined) } (do
+        with {  slice (base.bytesSlice 0 5 combined) } (|
           ? (base.bytesToText slice)
             Maybe.Just {  value t }  base.println t   -- hello
             Maybe.Nothing {}  base.println "<invalid utf-8>"
@@ -44,7 +44,7 @@ with {  raw (base.textToBytes "hello") } (do
             Maybe.Nothing {}  base.println "<out of bounds>"  -- raw has only 5 bytes
 
           -- Bytes literals: a string via textToBytes
-          with {  withHex (base.textToBytes "HI") } (do
+          with {  withHex (base.textToBytes "HI") } (|
             ? (base.bytesToText withHex)
               Maybe.Just {  value t }  base.println t   -- HI
               Maybe.Nothing {}  base.println "<invalid utf-8>"

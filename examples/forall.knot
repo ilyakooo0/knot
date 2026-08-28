@@ -17,7 +17,7 @@ _  applyTwice  (\((forall a. a -> a)  f) -> {asText (f "text")  asInt (f 42)})
 _  wrapAny  (\((forall a. a -> Rel a)  f) -> {nums (f 7)  words (f "seven")})
 
 }
-(do
+(|
   -- `\y -> y` is the polymorphic identity; the callee applies it at Text and Int.
   with {  r (applyTwice (\y -> y)) }
     (base.println (r.asText ++ " and " ++ base.show r.asInt))

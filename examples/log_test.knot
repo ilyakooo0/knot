@@ -1,4 +1,4 @@
-(do
+(|
   base.info "starting up"
   base.warn "something looks fishy"
   base.error "something is broken"

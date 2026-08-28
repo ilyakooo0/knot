@@ -622,7 +622,6 @@ impl Parser {
                 Ok((n, tok.span))
             }
             TokenKind::Where
-            | TokenKind::Do
             | TokenKind::Not
             | TokenKind::Full
             | TokenKind::Atomic
@@ -1358,7 +1357,10 @@ impl Parser {
             // other uses are in route query params and type position, never
             // where an expression begins.
             TokenKind::Question => self.parse_case(),
-            TokenKind::Do => self.parse_do_expr(),
+            // `|` opens a do block. `|` in atom position is unambiguous: its
+            // other use (the open-record row variable `{f T | rest}`) is inside
+            // braces, never where an expression begins.
+            TokenKind::Pipe => self.parse_do_expr(),
             // `< Api` opens a serve block. `<` in atom position is unambiguous:
             // a comparison `a < b` has a left operand, so a leading `<` is
             // never the less-than operator.
@@ -1627,7 +1629,7 @@ impl Parser {
             let rhs = if matches!(
                 self.peek(),
                 TokenKind::Question
-                    | TokenKind::Do
+                    | TokenKind::Pipe
                     | TokenKind::Backslash
                     | TokenKind::Atomic
                     | TokenKind::Refine
@@ -1817,7 +1819,7 @@ impl Parser {
             | TokenKind::LBrace
             | TokenKind::LBracket
             | TokenKind::Full
-            | TokenKind::Do => true,
+            | TokenKind::Pipe => true,
             // `yield` is not a keyword but should not start application atoms
             // (like keywords), to prevent `f; yield x` from parsing as `f yield x`
             // in inline do-blocks where `;` is lexed as Newline.
@@ -2269,7 +2271,7 @@ impl Parser {
                     Span::new(start.start, end_tok.span.end),
                 ))
             }
-            TokenKind::Do => self.parse_do_expr(),
+            TokenKind::Pipe => self.parse_do_expr(),
             TokenKind::Lt => self.parse_serve_expr(),
             TokenKind::LBrace => {
                 self.advance();
@@ -2595,7 +2597,7 @@ impl Parser {
                         && !matches!(self.peek(), TokenKind::Newline | TokenKind::RBrace)
                         && !self.at_layout_boundary();
                     if inline_value {
-                        let Some(value) = (if self.at(&TokenKind::Backslash) || self.at(&TokenKind::Do)
+                        let Some(value) = (if self.at(&TokenKind::Backslash) || self.at(&TokenKind::Pipe)
                         {
                             let prev_bi = self.block_indent;
                             let prev_bd = self.block_delim;
@@ -2708,7 +2710,7 @@ impl Parser {
             // to the field's column so the value's body terminates at the next
             // field (same column) via `at_layout_boundary` instead of absorbing
             // it. Mirrors the migration lambda in `parse_source_field_migration`.
-            let Some(value) = (if self.at(&TokenKind::Backslash) || self.at(&TokenKind::Do) {
+            let Some(value) = (if self.at(&TokenKind::Backslash) || self.at(&TokenKind::Pipe) {
                 let prev_bi = self.block_indent;
                 let prev_bd = self.block_delim;
                 self.block_indent = field_col;
@@ -3182,7 +3184,7 @@ impl Parser {
             return None;
         }
         let result = self.in_context("do expression", |this| {
-            this.advance(); // consume `do`
+            this.advance(); // consume `|`
 
             // `parse_stmt` pushes bind/let names so later statements see
             // them as bound; the whole do-block scope ends here.

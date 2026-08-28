@@ -1,6 +1,6 @@
 -- UUIDv7 example
 
-(do
+(|
   u <- base.randomUuid
   base.println u
   v <- base.randomUuid

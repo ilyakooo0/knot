@@ -5,7 +5,7 @@ Person  {name Text  age (Int 1)}
 
 Rel {name Text  members (Rel Person)}  *teams
 }
-(do
+(|
   full *teams = [
     {  name "Engineering"  members [{  name "Alice"  age 30 }  {  name "Bob"  age 25 }  {  name "Eve"  age 22 }] } 
     {  name "Design"  members [{  name "Carol"  age 35 }  {  name "Eve"  age 22 }] }
@@ -14,20 +14,20 @@ Rel {name Text  members (Rel Person)}  *teams
   -- Read nested members: bind the team, then bind its members field.
   base.println "Before:"
   teams <- *teams
-  base.forEach teams (\t -> do
+  base.forEach teams (\t -> |
     base.forEach t.members (\m -> base.println ("  " ++ t.name ++ ": " ++ m.name)))
 
   -- Remove Eve from every team: rewrite each team's members list.
-  *teams = do
+  *teams = |
     t <- teams
-    yield (base.unify t {members (do
+    yield (base.unify t {members (|
       m <- t.members
       where m.name != "Eve"
       yield m) })
 
   base.println "After:"
   teams2 <- *teams
-  base.forEach teams2 (\t -> do
+  base.forEach teams2 (\t -> |
     base.forEach t.members (\m -> base.println ("  " ++ t.name ++ ": " ++ m.name)))
 
   yield {})

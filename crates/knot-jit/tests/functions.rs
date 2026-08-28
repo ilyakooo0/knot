@@ -66,7 +66,7 @@ Int 1 -> Maybe (Int 1)  pos  (\x -> ? (x > 0)
   Bool.True {}  Maybe.Just {value x}
   Bool.False {}  Maybe.Nothing {})
 }
-(do
+(|
   base.println (base.show (base.traverse pos [1  2  3]))
   base.println (base.show (base.traverse pos [1  (-2)  3]))
   yield {})"#,
@@ -238,7 +238,7 @@ fn io_arg_to_dropping_fn_does_not_run() {
         r#"with {
 _  ignore  (\io -> 7)
 }
-(do
+(|
   ignore (? (Bool.True {})
     (Bool.True {})   (base.println "FIRED")
     (Bool.False {})  (base.println "other"))
@@ -256,8 +256,8 @@ fn io_arg_do_block_to_dropping_fn_does_not_run() {
         r#"with {
 _  ignore  (\io -> 7)
 }
-(do
-  ignore (do
+(|
+  ignore (|
     base.println "FIRED"
     yield {})
   base.println "done"
@@ -274,7 +274,7 @@ fn io_arg_to_running_fn_still_runs() {
         r#"with {
 _  runIt  (\io -> base.run io)
 }
-(do
+(|
   runIt (? (Bool.True {})
     (Bool.True {})   (base.println "ran")
     (Bool.False {})  (base.println "other"))
@@ -295,7 +295,7 @@ _  runIt  (\io -> base.run io)
 fn io_builtin_passed_as_function_is_not_deferred() {
     assert_stdout(
         "iofn",
-        r#"(do
+        r#"(|
   base.traverse base.println [1  2]
   base.println "done"
   yield {})"#,

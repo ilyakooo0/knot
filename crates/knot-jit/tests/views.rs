@@ -11,11 +11,11 @@ fn derived_relation_reads_source() {
         "drv_read",
         r#"with {
 Rel {manager Text  report Text}  *manages
-directReports (do
+directReports (|
   m <- *manages
   yield {manager m.manager  report m.report})
 }
-(do
+(|
   full *manages = [{manager "A"  report "B"}  {manager "A"  report "C"}  {manager "B"  report "D"}]
   base.println (base.show (base.count directReports))
   yield {})"#,
@@ -31,11 +31,11 @@ fn derived_relation_recomputes_on_access() {
         "drv_recompute",
         r#"with {
 Rel {n (Int 1)}  *items
-doubled (do
+doubled (|
   r <- *items
   yield {n (r.n * 2)})
 }
-(do
+(|
   full *items = [{n 1}]
   a <- base.run doubled
   base.println (base.show a)
@@ -53,13 +53,13 @@ fn derived_relation_aggregates() {
         "drv_agg",
         r#"with {
 Rel {region Text  amount (Int 1)}  *sales
-amounts (do
+amounts (|
   r <- *sales
   yield {amount r.amount})
 }
-(do
+(|
   full *sales = [{region "x"  amount 10}  {region "y"  amount 20}  {region "x"  amount 5}]
-  base.println (base.show {sum (base.sum (do r <- amounts; yield r.amount))})
+  base.println (base.show {sum (base.sum (| r <- amounts; yield r.amount))})
   yield {})"#,
         // a query field iterated in an aggregate comprehension over the source
         "\"{sum 35}\"\n{}",

@@ -1,6 +1,6 @@
 -- Elliptic curve cryptography demo
 
-(do
+(|
   -- Key pair generation for encryption (X25519)
   keys <- base.generateKeyPair
   base.println "Encryption key pair generated"
@@ -9,7 +9,7 @@
   -- Encrypt is Maybe — Nothing if the public key is unusable (wrong length or
   -- a low-order point). Keys often come from a peer, so this is a value to
   -- handle, not a crash.
-  with {  message (base.textToBytes "Hello, cryptography!") } (do
+  with {  message (base.textToBytes "Hello, cryptography!") } (|
     encrypted <- base.encrypt keys.publicKey message
     ? (encrypted)
       Maybe.Nothing {}  base.println "  Encryption failed: bad public key"
@@ -24,7 +24,7 @@
             Maybe.Nothing  base.println "  Decrypted: <invalid utf-8>"
 
         -- Tampering with the ciphertext is caught by the authentication tag.
-        with {  tampered (base.bytesConcat (base.bytesSlice 0 40 ciphertext) (base.textToBytes "XXXX")) } (do
+        with {  tampered (base.bytesConcat (base.bytesSlice 0 40 ciphertext) (base.textToBytes "XXXX")) } (|
           ? (base.decrypt keys.privateKey tampered)
             Maybe.Nothing {}  base.println "  Tampered ciphertext rejected"
             Maybe.Just {  value _ }  base.println "  BUG: tampered ciphertext decrypted"
@@ -41,12 +41,12 @@
       Maybe.Just {  value sig }  do
         base.println ("  Signature: " ++ base.bytesToHex sig)
 
-        with {  valid (base.verify sigKeys.publicKey message sig) } (do
+        with {  valid (base.verify sigKeys.publicKey message sig) } (|
           base.println ("  Valid: " ++ base.show valid)
 
           -- Verify with wrong message should fail
-          with {  wrongMsg (base.textToBytes "Wrong message") } (do
-            with {  invalid (base.verify sigKeys.publicKey wrongMsg sig) } (do
+          with {  wrongMsg (base.textToBytes "Wrong message") } (|
+            with {  invalid (base.verify sigKeys.publicKey wrongMsg sig) } (|
               base.println ("  Invalid (wrong msg): " ++ base.show invalid)
               yield {})))
 

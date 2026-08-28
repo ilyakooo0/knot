@@ -5,15 +5,15 @@
 -- race returns close to the winner's wall-clock time rather than the
 -- loser's.
 with {
-slow (do
+slow (|
   base.sleep (base.the (Int Ms) 1000)
   yield "slow")
 
-fast (do
+fast (|
   base.sleep (base.the (Int Ms) 50)
   yield "fast")
 }
-(do
+(|
   start1 <- base.now
   r1 <- base.race slow fast
   end1 <- base.now

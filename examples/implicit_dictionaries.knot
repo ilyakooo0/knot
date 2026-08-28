@@ -25,7 +25,7 @@ intOrdDesc {compare (\a b -> ? (a < b)
     Bool.True {}  hi
     Bool.False {}  x)
 }
-(do
+(|
     base.println (base.show (with intOrd (clamp 0 10 42)))
     base.println (base.show (with textOrd (clamp "a" "m" "z")))
     base.println (base.show (with intOrdDesc (clamp 0 10 42))))

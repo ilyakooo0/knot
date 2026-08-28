@@ -11,7 +11,7 @@ Rel {customer Text  amount (Int 1)}  *orders
 -- Uniqueness  email uniquely  identifies a  person
 *people <= *people.email
 }
-(do
+(|
   -- Insert some people
   full *people = [{  name "Alice"  age 30  email "alice@example.com" }  {  name "Bob"  age 25  email "bob@example.com" }]
 

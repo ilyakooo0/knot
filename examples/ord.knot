@@ -48,7 +48,7 @@ _  clamp  (\lo hi ord x ->
       Bool.True {}  hi
       Bool.False {}  x)
 }
-(do
+(|
   -- Same function, different types — just different dictionaries.
   base.println (base.show (clamp 0 10 intOrd 42))          -- 10  (Int, clamped high)
   base.println (base.show (clamp 0 10 intOrd 3))           -- 3   (Int, in range)

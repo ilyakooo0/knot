@@ -9,32 +9,32 @@ _  safeDivide  (\x y -> ? (y == 0)
   Bool.True {}  Maybe.Nothing {}
   Bool.False {}  Maybe.Just {value (x / y)})
 
-result1 (do
+result1 (|
   a <- Maybe.Just {value 10}
   b <- Maybe.Just {value 2}
   c <- safeDivide a b
   yield c)
 
-result2 (do
+result2 (|
   a <- Maybe.Just {value 10}
   b <- Maybe.Just {value 0}
   c <- safeDivide a b
   yield c)
 
 -- Test where  clause (uses empty for filtering)
-result3 (do
+result3 (|
   a <- Maybe.Just {value 10}
   b <- Maybe.Just {value 3}
   where b > 2
   yield (a + b))
 
-result4 (do
+result4 (|
   a <- Maybe.Just {value 10}
   b <- Maybe.Just {value 1}
   where b > 2
   yield (a + b))
 }
-(do
+(|
   base.println (base.show result1)
   base.println (base.show result2)
   base.println (base.show result3)

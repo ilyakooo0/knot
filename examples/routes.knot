@@ -10,24 +10,24 @@ api Api where
   CreateTodo  post /todos ={title Text  owner Text  priority Text} -> Todo
   GetCount  get /admin/count -> Int 1
 
-_  addTodo  (\title owner priority -> do
+_  addTodo  (\title owner priority -> |
   rows <- *todos
   *todos = base.union rows [{title title  owner owner  priority (Priority.Low {})}])
 
 srv (< Api
-  GetTodos = \{owner owner  xForwardedFor xForwardedFor} -> do
+  GetTodos = \{owner owner  xForwardedFor xForwardedFor} -> |
     ? (xForwardedFor)
       Maybe.Just {value ip}  base.info ("GetTodos from " ++ ip)
       Maybe.Nothing {}  base.info "GetTodos (no proxy header)"
     rows <- *todos
-    with {matching (base.filter (\t -> t.owner == owner) rows)} (do
+    with {matching (base.filter (\t -> t.owner == owner) rows)} (|
       ? (base.count matching == 0)
         Bool.True {}  yield (Result.Err {error {status 404  message "no todos found for owner"}})
         Bool.False {}  yield (Result.Ok {value matching}))
-  CreateTodo = \{title title  owner owner  priority priority} -> do
+  CreateTodo = \{title title  owner owner  priority priority} -> |
     addTodo title owner priority
     yield (Result.Ok {value {title title  owner owner  priority (Priority.Low {})}})
-  GetCount = \{} -> do
+  GetCount = \{} -> |
     rows <- *todos
     yield (Result.Ok {value (base.count rows)}))
 }

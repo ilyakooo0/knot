@@ -9,17 +9,17 @@ doubled (base.map (\n -> n * 2) nums)
 total (base.fold (\acc n -> acc + n) 0 nums)
 evens (base.filter (\n -> n % 2 == 0) nums)
 
-divChain (do
+divChain (|
   a <- safeDiv 20 4
   b <- safeDiv a 0
   yield (b + 1))
 
-divOk (do
+divOk (|
   a <- safeDiv 20 4
   b <- safeDiv a 5
   yield b)
 }
-(do
+(|
   base.println ("doubled: " ++ base.show doubled)
   base.println ("total:   " ++ base.show total)
   base.println ("evens:   " ++ base.show evens)

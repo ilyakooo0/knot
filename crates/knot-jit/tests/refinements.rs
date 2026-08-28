@@ -63,7 +63,7 @@ fn refine_cross_field() {
 R  {lo (Int 1)  hi (Int 1)} \r ->  r.lo <=  r.hi
 {lo (Int 1)  hi (Int 1)} -> Result {typeName Text  violations (Rel {field (Maybe Text)  message Text})} R  asR  (\r -> refine r)
 }
-(do
+(|
   (? (asR {lo 5  hi 2})
     Result.Ok {value _}  base.println "ok"
     Result.Err {error _}  base.println "bad")
@@ -88,7 +88,7 @@ fn write_validation_rejects_violation() {
 Nat  Int 1 \x ->  x >= 0
 Rel {name Text  age Nat}  *people
 }
-(do
+(|
   full *people = [{name "a"  age (0 - 5)}]
   base.println "wrote"
   yield {})"#,
@@ -115,7 +115,7 @@ fn write_validation_accepts_valid() {
 Nat  Int 1 \x ->  x >= 0
 Rel {name Text  age Nat}  *people
 }
-(do
+(|
   full *people = [{name "a"  age 30}]
   base.println (base.show (base.count *people))
   yield {})"#,

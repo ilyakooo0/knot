@@ -67,7 +67,7 @@ fn corner_add_field_constant_default() {
 V1  {name Text}
 Rel V1  *people
 }
-(do
+(|
   full *people = [{name "a"}  {name "b"}]
   yield {})"#;
     let v2 = r#"with {
@@ -76,14 +76,14 @@ V2  {name Text  active (Int 1)}
 Rel V2  *people
   \p -> {name p.name  active 1}
 }
-(do
+(|
   yield {})"#;
     let committed = r#"with {
 V1  {name Text}
 V2  {name Text  active (Int 1)}
 Rel V2  *people
 }
-(do
+(|
   rows <- *people
   base.println (base.show rows)
   yield {})"#;
@@ -99,7 +99,7 @@ fn corner_drop_field() {
 V1  {name Text  age (Int 1)}
 Rel V1  *people
 }
-(do
+(|
   full *people = [{name "a"  age 5}]
   yield {})"#;
     let v2 = r#"with {
@@ -108,14 +108,14 @@ V2  {name Text}
 Rel V2  *people
   \p -> {name p.name}
 }
-(do
+(|
   yield {})"#;
     let committed = r#"with {
 V1  {name Text  age (Int 1)}
 V2  {name Text}
 Rel V2  *people
 }
-(do
+(|
   rows <- *people
   base.println (base.show rows)
   yield {})"#;
@@ -131,7 +131,7 @@ fn corner_rename_field() {
 V1  {name Text}
 Rel V1  *people
 }
-(do
+(|
   full *people = [{name "a"}]
   yield {})"#;
     let v2 = r#"with {
@@ -140,14 +140,14 @@ V2  {fullName Text}
 Rel V2  *people
   \p -> {fullName p.name}
 }
-(do
+(|
   yield {})"#;
     let committed = r#"with {
 V1  {name Text}
 V2  {fullName Text}
 Rel V2  *people
 }
-(do
+(|
   rows <- *people
   base.println (base.show rows)
   yield {})"#;
@@ -163,7 +163,7 @@ fn corner_reorder_fields() {
 V1  {a Text  b (Int 1)}
 Rel V1  *r
 }
-(do
+(|
   full *r = [{a "x"  b 1}]
   yield {})"#;
     let v2 = r#"with {
@@ -172,14 +172,14 @@ V2  {b (Int 1)  a Text}
 Rel V2  *r
   \p -> {b p.b  a p.a}
 }
-(do
+(|
   yield {})"#;
     let committed = r#"with {
 V1  {a Text  b (Int 1)}
 V2  {b (Int 1)  a Text}
 Rel V2  *r
 }
-(do
+(|
   rows <- *r
   base.println (base.show rows)
   yield {})"#;
@@ -198,7 +198,7 @@ fn corner_relation_of_scalars_field() {
 V1  {name Text  tags (Rel Text)}
 Rel V1  *people
 }
-(do
+(|
   full *people = [{name "a"  tags ["x"  "y"]}]
   yield {})"#;
     let v2 = r#"with {
@@ -207,14 +207,14 @@ V2  {name Text  tags (Rel Text)  extra (Int 1)}
 Rel V2  *people
   \p -> {name p.name  tags p.tags  extra 0}
 }
-(do
+(|
   yield {})"#;
     let committed = r#"with {
 V1  {name Text  tags (Rel Text)}
 V2  {name Text  tags (Rel Text)  extra (Int 1)}
 Rel V2  *people
 }
-(do
+(|
   rows <- *people
   base.println (base.show rows)
   yield {})"#;
@@ -232,7 +232,7 @@ Pet  {name Text  legs (Int 1)}
 V1  {name Text  pets (Rel Pet)}
 Rel V1  *people
 }
-(do
+(|
   full *people = [{name "a"  pets [{name "pup"  legs 4}]}]
   yield {})"#;
     let v2 = r#"with {
@@ -242,7 +242,7 @@ V2  {name Text  pets (Rel Pet)  extra (Int 1)}
 Rel V2  *people
   \p -> {name p.name  pets p.pets  extra 0}
 }
-(do
+(|
   yield {})"#;
     let committed = r#"with {
 Pet  {name Text  legs (Int 1)}
@@ -250,7 +250,7 @@ V1  {name Text  pets (Rel Pet)}
 V2  {name Text  pets (Rel Pet)  extra (Int 1)}
 Rel V2  *people
 }
-(do
+(|
   rows <- *people
   base.println (base.show rows)
   yield {})"#;
@@ -266,7 +266,7 @@ fn corner_relation_of_relations_field() {
 V1  {name Text  grid (Rel (Rel (Int 1)))}
 Rel V1  *r
 }
-(do
+(|
   full *r = [{name "a"  grid [[1  2]  [3]]}]
   yield {})"#;
     let v2 = r#"with {
@@ -275,14 +275,14 @@ V2  {name Text  grid (Rel (Rel (Int 1)))  extra (Int 1)}
 Rel V2  *r
   \p -> {name p.name  grid p.grid  extra 0}
 }
-(do
+(|
   yield {})"#;
     let committed = r#"with {
 V1  {name Text  grid (Rel (Rel (Int 1)))}
 V2  {name Text  grid (Rel (Rel (Int 1)))  extra (Int 1)}
 Rel V2  *r
 }
-(do
+(|
   rows <- *r
   base.println (base.show rows)
   yield {})"#;
@@ -299,7 +299,7 @@ Addr  {city Text}
 V1  {name Text  addr Addr}
 Rel V1  *people
 }
-(do
+(|
   full *people = [{name "a"  addr {city "x"}}]
   yield {})"#;
     let v2 = r#"with {
@@ -309,7 +309,7 @@ V2  {name Text  addr Addr  extra (Int 1)}
 Rel V2  *people
   \p -> {name p.name  addr p.addr  extra 0}
 }
-(do
+(|
   yield {})"#;
     let committed = r#"with {
 Addr  {city Text}
@@ -317,7 +317,7 @@ V1  {name Text  addr Addr}
 V2  {name Text  addr Addr  extra (Int 1)}
 Rel V2  *people
 }
-(do
+(|
   rows <- *people
   base.println (base.show rows)
   yield {})"#;
@@ -335,7 +335,7 @@ Addr  {city Text}
 V1  {name Text  addr Addr}
 Rel V1  *people
 }
-(do
+(|
   full *people = [{name "a"  addr {city "x"}}]
   yield {})"#;
     let v2 = r#"with {
@@ -346,7 +346,7 @@ V2  {name Text  addr AddrV2}
 Rel V2  *people
   \p -> {name p.name  addr {city p.addr.city  zip 0}}
 }
-(do
+(|
   yield {})"#;
     let committed = r#"with {
 Addr  {city Text}
@@ -355,7 +355,7 @@ V1  {name Text  addr Addr}
 V2  {name Text  addr AddrV2}
 Rel V2  *people
 }
-(do
+(|
   rows <- *people
   base.println (base.show rows)
   yield {})"#;
@@ -372,7 +372,7 @@ Shape  Circle {radius (Int 1)}  Point {}
 V1  {name Text  sh Shape}
 Rel V1  *es
 }
-(do
+(|
   full *es = [{name "a"  sh (Shape.Circle {radius 3})}]
   yield {})"#;
     let v2 = r#"with {
@@ -382,7 +382,7 @@ V2  {name Text  sh Shape  extra (Int 1)}
 Rel V2  *es
   \p -> {name p.name  sh p.sh  extra 0}
 }
-(do
+(|
   yield {})"#;
     let committed = r#"with {
 Shape  Circle {radius (Int 1)}  Point {}
@@ -390,7 +390,7 @@ V1  {name Text  sh Shape}
 V2  {name Text  sh Shape  extra (Int 1)}
 Rel V2  *es
 }
-(do
+(|
   rows <- *es
   base.println (base.show rows)
   yield {})"#;
@@ -408,7 +408,7 @@ fn corner_adt_source_migration() {
 Ev  Ping {}  Msg {text Text}
 Rel Ev  *evs
 }
-(do
+(|
   full *evs = [(Ev.Ping {})  (Ev.Msg {text "hi"})]
   yield {})"#;
     let v2 = r#"with {
@@ -419,14 +419,14 @@ Rel EvV2  *evs
     Ev.Ping {}  (EvV2.Ping {})
     Ev.Msg {text t}  (EvV2.Msg {text t  loud 0}))
 }
-(do
+(|
   yield {})"#;
     let committed = r#"with {
 Ev  Ping {}  Msg {text Text}
 EvV2  Ping {}  Msg {text Text  loud (Int 1)}
 Rel EvV2  *evs
 }
-(do
+(|
   rows <- *evs
   base.println (base.show (base.count rows))
   yield {})"#;
@@ -444,7 +444,7 @@ fn corner_empty_relation() {
 V1  {a (Int 1)}
 Rel V1  *r
 }
-(do
+(|
   yield {})"#;
     let v2 = r#"with {
 V1  {a (Int 1)}
@@ -452,14 +452,14 @@ V2  {a (Int 1)  b (Int 1)}
 Rel V2  *r
   \p -> {a p.a  b 0}
 }
-(do
+(|
   yield {})"#;
     let committed = r#"with {
 V1  {a (Int 1)}
 V2  {a (Int 1)  b (Int 1)}
 Rel V2  *r
 }
-(do
+(|
   rows <- *r
   base.println (base.show (base.count rows))
   yield {})"#;
@@ -475,7 +475,7 @@ fn corner_multiple_rows() {
 V1  {name Text}
 Rel V1  *people
 }
-(do
+(|
   full *people = [{name "a"}  {name "b"}  {name "c"}  {name "d"}]
   yield {})"#;
     let v2 = r#"with {
@@ -484,14 +484,14 @@ V2  {name Text  tag (Int 1)}
 Rel V2  *people
   \p -> {name p.name  tag 7}
 }
-(do
+(|
   yield {})"#;
     let committed = r#"with {
 V1  {name Text}
 V2  {name Text  tag (Int 1)}
 Rel V2  *people
 }
-(do
+(|
   rows <- *people
   base.println (base.show (base.count rows))
   yield {})"#;
@@ -510,7 +510,7 @@ fn corner_multi_step_chain() {
 V1  {name Text}
 Rel V1  *r
 }
-(do
+(|
   full *r = [{name "x"}]
   yield {})"#;
     let v2 = r#"with {
@@ -519,7 +519,7 @@ V2  {name Text  b Text}
 Rel V2  *r
   \p -> {name p.name  b p.name}
 }
-(do
+(|
   yield {})"#;
     let v3 = r#"with {
 V1  {name Text}
@@ -528,7 +528,7 @@ V3  {name Text  b Text  c Text}
 Rel V3  *r
   \p -> {name p.name  b p.b  c p.b}
 }
-(do
+(|
   yield {})"#;
     let committed = r#"with {
 V1  {name Text}
@@ -536,7 +536,7 @@ V2  {name Text  b Text}
 V3  {name Text  b Text  c Text}
 Rel V3  *r
 }
-(do
+(|
   rows <- *r
   base.println (base.show rows)
   yield {})"#;
@@ -566,7 +566,7 @@ fn corner_add_relation_field() {
 V1  {name Text}
 Rel V1  *people
 }
-(do
+(|
   full *people = [{name "a"}]
   yield {})"#;
     let v2 = r#"with {
@@ -575,14 +575,14 @@ V2  {name Text  tags (Rel Text)}
 Rel V2  *people
   \p -> {name p.name  tags ["new"]}
 }
-(do
+(|
   yield {})"#;
     let committed = r#"with {
 V1  {name Text}
 V2  {name Text  tags (Rel Text)}
 Rel V2  *people
 }
-(do
+(|
   rows <- *people
   base.println (base.show rows)
   yield {})"#;
@@ -599,7 +599,7 @@ fn corner_drop_relation_field() {
 V1  {name Text  tags (Rel Text)}
 Rel V1  *people
 }
-(do
+(|
   full *people = [{name "a"  tags ["x"]}]
   yield {})"#;
     let v2 = r#"with {
@@ -608,14 +608,14 @@ V2  {name Text}
 Rel V2  *people
   \p -> {name p.name}
 }
-(do
+(|
   yield {})"#;
     let committed = r#"with {
 V1  {name Text  tags (Rel Text)}
 V2  {name Text}
 Rel V2  *people
 }
-(do
+(|
   rows <- *people
   base.println (base.show rows)
   yield {})"#;
@@ -632,7 +632,7 @@ fn corner_change_relation_element_type() {
 V1  {name Text  tags (Rel Text)}
 Rel V1  *people
 }
-(do
+(|
   full *people = [{name "a"  tags ["x"]}]
   yield {})"#;
     let v2 = r#"with {
@@ -641,14 +641,14 @@ V2  {name Text  nums (Rel (Int 1))}
 Rel V2  *people
   \p -> {name p.name  nums [1  2]}
 }
-(do
+(|
   yield {})"#;
     let committed = r#"with {
 V1  {name Text  tags (Rel Text)}
 V2  {name Text  nums (Rel (Int 1))}
 Rel V2  *people
 }
-(do
+(|
   rows <- *people
   base.println (base.show rows)
   yield {})"#;
@@ -668,7 +668,7 @@ Rel V1  *people
 W  {id (Int 1)}
 Rel W  *widgets
 }
-(do
+(|
   full *people = [{name "a"}]
   full *widgets = [{id 1}]
   yield {})"#;
@@ -680,7 +680,7 @@ Rel V2  *people
 W  {id (Int 1)}
 Rel W  *widgets
 }
-(do
+(|
   yield {})"#;
     let committed = r#"with {
 V1  {name Text}
@@ -689,7 +689,7 @@ Rel V2  *people
 W  {id (Int 1)}
 Rel W  *widgets
 }
-(do
+(|
   p <- *people
   w <- *widgets
   base.println (base.show p)
@@ -710,7 +710,7 @@ Rel V1  *people
 W  {id (Int 1)}
 Rel W  *widgets
 }
-(do
+(|
   full *people = [{name "a"}]
   full *widgets = [{id 1}]
   yield {})"#;
@@ -718,13 +718,13 @@ Rel W  *widgets
 V1  {name Text}
 Rel V1  *people
 }
-(do
+(|
   yield {})"#;
     let committed = r#"with {
 V1  {name Text}
 Rel V1  *people
 }
-(do
+(|
   rows <- *people
   base.println (base.show rows)
   yield {})"#;
@@ -743,7 +743,7 @@ Color  Red {}  Green {}
 V1  {name Text  col Color}
 Rel V1  *es
 }
-(do
+(|
   full *es = [{name "a"  col (Color.Red {})}]
   yield {})"#;
     let v2 = r#"with {
@@ -753,7 +753,7 @@ V2  {name Text  col Color  extra (Int 1)}
 Rel V2  *es
   \p -> {name p.name  col p.col  extra 0}
 }
-(do
+(|
   yield {})"#;
     let committed = r#"with {
 Color  Red {}  Green {}
@@ -761,7 +761,7 @@ V1  {name Text  col Color}
 V2  {name Text  col Color  extra (Int 1)}
 Rel V2  *es
 }
-(do
+(|
   rows <- *es
   base.println (base.show rows)
   yield {})"#;
@@ -777,7 +777,7 @@ fn corner_retype_scalar() {
 V1  {name Text}
 Rel V1  *people
 }
-(do
+(|
   full *people = [{name "a"}]
   yield {})"#;
     let v2 = r#"with {
@@ -786,14 +786,14 @@ V2  {name (Int 1)}
 Rel V2  *people
   \p -> {name 42}
 }
-(do
+(|
   yield {})"#;
     let committed = r#"with {
 V1  {name Text}
 V2  {name (Int 1)}
 Rel V2  *people
 }
-(do
+(|
   rows <- *people
   base.println (base.show rows)
   yield {})"#;
@@ -809,7 +809,7 @@ fn corner_transform_to_payload_adt() {
 V1  {n (Int 1)}
 Rel V1  *r
 }
-(do
+(|
   full *r = [{n 5}]
   yield {})"#;
     let v2 = r#"with {
@@ -819,7 +819,7 @@ V2  {sh Shape}
 Rel V2  *r
   \p -> {sh (Shape.Circle {radius p.n})}
 }
-(do
+(|
   yield {})"#;
     let committed = r#"with {
 Shape  Circle {radius (Int 1)}  Point {}
@@ -827,7 +827,7 @@ V1  {n (Int 1)}
 V2  {sh Shape}
 Rel V2  *r
 }
-(do
+(|
   rows <- *r
   base.println (base.show rows)
   yield {})"#;
@@ -847,7 +847,7 @@ V1  {name Text}
 Rel V1  *people
 *people <= *people.name
 }
-(do
+(|
   full *people = [{name "a"}]
   yield {})"#;
     let v2 = r#"with {
@@ -857,7 +857,7 @@ Rel V2  *people
   \p -> {name p.name  extra 0}
 *people <= *people.name
 }
-(do
+(|
   yield {})"#;
     let committed = r#"with {
 V1  {name Text}
@@ -865,7 +865,7 @@ V2  {name Text  extra (Int 1)}
 Rel V2  *people
 *people <= *people.name
 }
-(do
+(|
   rows <- *people
   base.println (base.show rows)
   yield {})"#;
@@ -884,7 +884,7 @@ fn corner_revert_chain_with_data() {
 V1  {name Text}
 Rel V1  *people
 }
-(do
+(|
   full *people = [{name "a"}]
   yield {})"#;
     let v2 = r#"with {
@@ -893,7 +893,7 @@ V2  {name Text  extra (Int 1)}
 Rel V2  *people
   \p -> {name p.name  extra 1}
 }
-(do
+(|
   yield {})"#;
     let v1_revert = r#"with {
 V1  {name Text}
@@ -901,14 +901,14 @@ V2  {name Text  extra (Int 1)}
 Rel V1  *people
   \p -> {name p.name}
 }
-(do
+(|
   yield {})"#;
     let committed = r#"with {
 V1  {name Text}
 V2  {name Text  extra (Int 1)}
 Rel V1  *people
 }
-(do
+(|
   rows <- *people
   base.println (base.show rows)
   yield {})"#;
@@ -935,7 +935,7 @@ fn corner_migration_clause_on_unchanged_schema_is_an_error() {
 V1  {name Text}
 Rel V1  *people
 }
-(do
+(|
   full *people = [{name "a"}]
   yield {})"#;
     build_and_run(&dir, "mig_noop", v1);
@@ -948,7 +948,7 @@ V1  {name Text}
 Rel V1  *people
   \p -> {name p.name}
 }
-(do
+(|
   yield {})"#;
     std::fs::write(dir.join("mig_noop.knot"), noop).unwrap();
     let build = std::process::Command::new(knot_bin())
@@ -979,7 +979,7 @@ fn corner_maybe_field() {
 V1  {name Text  nick (Maybe Text)}
 Rel V1  *people
 }
-(do
+(|
   full *people = [{name "a"  nick (Maybe.Just {value "al"})}  {name "b"  nick (Maybe.Nothing {})}]
   yield {})"#;
     let v2 = r#"with {
@@ -988,14 +988,14 @@ V2  {name Text  nick (Maybe Text)  extra (Int 1)}
 Rel V2  *people
   \p -> {name p.name  nick p.nick  extra 0}
 }
-(do
+(|
   yield {})"#;
     let committed = r#"with {
 V1  {name Text  nick (Maybe Text)}
 V2  {name Text  nick (Maybe Text)  extra (Int 1)}
 Rel V2  *people
 }
-(do
+(|
   rows <- *people
   base.println (base.show rows)
   yield {})"#;
@@ -1014,7 +1014,7 @@ fn corner_float_field() {
 V1  {name Text  score (Float 1)}
 Rel V1  *r
 }
-(do
+(|
   full *r = [{name "a"  score 1.5}]
   yield {})"#;
     let v2 = r#"with {
@@ -1023,14 +1023,14 @@ V2  {name Text  score (Float 1)  extra (Int 1)}
 Rel V2  *r
   \p -> {name p.name  score p.score  extra 0}
 }
-(do
+(|
   yield {})"#;
     let committed = r#"with {
 V1  {name Text  score (Float 1)}
 V2  {name Text  score (Float 1)  extra (Int 1)}
 Rel V2  *r
 }
-(do
+(|
   rows <- *r
   base.println (base.show rows)
   yield {})"#;
@@ -1051,7 +1051,7 @@ Inner  {shapes (Rel Shape)}
 V1  {name Text  inner Inner}
 Rel V1  *r
 }
-(do
+(|
   full *r = [{name "a"  inner {shapes [(Shape.Point {})]}}]
   yield {})"#;
     let v2 = r#"with {
@@ -1062,7 +1062,7 @@ V2  {name Text  inner Inner  extra (Int 1)}
 Rel V2  *r
   \p -> {name p.name  inner p.inner  extra 0}
 }
-(do
+(|
   yield {})"#;
     let committed = r#"with {
 Shape  Circle {radius (Int 1)}  Point {}
@@ -1071,7 +1071,7 @@ V1  {name Text  inner Inner}
 V2  {name Text  inner Inner  extra (Int 1)}
 Rel V2  *r
 }
-(do
+(|
   rows <- *r
   base.println (base.show rows)
   yield {})"#;
@@ -1090,7 +1090,7 @@ Addr  {city Text  zip (Int 1)}
 V1  {name Text  addr Addr}
 Rel V1  *people
 }
-(do
+(|
   full *people = [{name "a"  addr {city "x"  zip 100}}]
   yield {})"#;
     let v2 = r#"with {
@@ -1100,7 +1100,7 @@ V2  {name Text  zip (Int 1)}
 Rel V2  *people
   \p -> {name p.name  zip p.addr.zip}
 }
-(do
+(|
   yield {})"#;
     let committed = r#"with {
 Addr  {city Text  zip (Int 1)}
@@ -1108,7 +1108,7 @@ V1  {name Text  addr Addr}
 V2  {name Text  zip (Int 1)}
 Rel V2  *people
 }
-(do
+(|
   rows <- *people
   base.println (base.show rows)
   yield {})"#;
@@ -1124,7 +1124,7 @@ fn corner_rename_and_retype() {
 V1  {old Text}
 Rel V1  *r
 }
-(do
+(|
   full *r = [{old "x"}]
   yield {})"#;
     let v2 = r#"with {
@@ -1133,14 +1133,14 @@ V2  {new (Int 1)}
 Rel V2  *r
   \p -> {new 1}
 }
-(do
+(|
   yield {})"#;
     let committed = r#"with {
 V1  {old Text}
 V2  {new (Int 1)}
 Rel V2  *r
 }
-(do
+(|
   rows <- *r
   base.println (base.show rows)
   yield {})"#;
@@ -1163,7 +1163,7 @@ V1  {email Text}
 Rel V1  *pets
 *pets.email <= *owners.email
 }
-(do
+(|
   full *owners = [{email "a@x"}]
   full *pets = [{email "a@x"}]
   yield {})"#;
@@ -1176,7 +1176,7 @@ Rel V2  *pets
   \p -> {email p.email  extra 0}
 *pets.email <= *owners.email
 }
-(do
+(|
   yield {})"#;
     let committed = r#"with {
 Owner  {email Text}
@@ -1186,7 +1186,7 @@ V2  {email Text  extra (Int 1)}
 Rel V2  *pets
 *pets.email <= *owners.email
 }
-(do
+(|
   rows <- *pets
   base.println (base.show rows)
   yield {})"#;
@@ -1206,7 +1206,7 @@ V1  {email Text}
 Rel V1  *pets
 *pets.email <= *owners.email
 }
-(do
+(|
   full *owners = [{email "a@x"}]
   full *pets = [{email "a@x"}]
   yield {})"#;
@@ -1219,7 +1219,7 @@ Rel V2  *pets
   \p -> {email p.email  extra 0}
 *pets.email <= *owners.email
 }
-(do
+(|
   yield {})"#;
     // Migrate + commit.
     build_and_run(&dir, "mig_subset_enforced", v1);
@@ -1237,7 +1237,7 @@ V2  {email Text  extra (Int 1)}
 Rel V2  *pets
 *pets.email <= *owners.email
 }
-(do
+(|
   pets <- *pets
   *pets = base.union pets [{email "missing@x"  extra 0}]
   yield {})"#;
@@ -1268,7 +1268,7 @@ fn corner_scalar_to_maybe() {
 V1  {name Text}
 Rel V1  *people
 }
-(do
+(|
   full *people = [{name "a"}]
   yield {})"#;
     let v2 = r#"with {
@@ -1277,14 +1277,14 @@ V2  {name (Maybe Text)}
 Rel V2  *people
   \p -> {name (Maybe.Just {value p.name})}
 }
-(do
+(|
   yield {})"#;
     let committed = r#"with {
 V1  {name Text}
 V2  {name (Maybe Text)}
 Rel V2  *people
 }
-(do
+(|
   rows <- *people
   base.println (base.show rows)
   yield {})"#;
@@ -1301,7 +1301,7 @@ fn corner_maybe_to_scalar() {
 V1  {name (Maybe Text)}
 Rel V1  *people
 }
-(do
+(|
   full *people = [{name (Maybe.Just {value "a"})}  {name (Maybe.Nothing {})}]
   yield {})"#;
     let v2 = r#"with {
@@ -1312,14 +1312,14 @@ Rel V2  *people
     Maybe.Just {value v}  v
     Maybe.Nothing {}  "anon")}
 }
-(do
+(|
   yield {})"#;
     let committed = r#"with {
 V1  {name (Maybe Text)}
 V2  {name Text}
 Rel V2  *people
 }
-(do
+(|
   rows <- *people
   base.println (base.show rows)
   yield {})"#;
@@ -1337,7 +1337,7 @@ fn corner_arithmetic_computed_field() {
 V1  {age (Int 1)}
 Rel V1  *r
 }
-(do
+(|
   full *r = [{age 5}]
   yield {})"#;
     let v2 = r#"with {
@@ -1346,14 +1346,14 @@ V2  {age (Int 1)  doubled (Int 1)}
 Rel V2  *r
   \p -> {age p.age  doubled (p.age * 2)}
 }
-(do
+(|
   yield {})"#;
     let committed = r#"with {
 V1  {age (Int 1)}
 V2  {age (Int 1)  doubled (Int 1)}
 Rel V2  *r
 }
-(do
+(|
   rows <- *r
   base.println (base.show rows)
   yield {})"#;
@@ -1370,7 +1370,7 @@ fn corner_retype_via_base_show() {
 V1  {n (Int 1)}
 Rel V1  *r
 }
-(do
+(|
   full *r = [{n 7}]
   yield {})"#;
     let v2 = r#"with {
@@ -1379,14 +1379,14 @@ V2  {n Text}
 Rel V2  *r
   \p -> {n (base.show p.n)}
 }
-(do
+(|
   yield {})"#;
     let committed = r#"with {
 V1  {n (Int 1)}
 V2  {n Text}
 Rel V2  *r
 }
-(do
+(|
   rows <- *r
   base.println (base.show rows)
   yield {})"#;
@@ -1404,7 +1404,7 @@ fn corner_adt_gains_constructor() {
 Ev  Ping {}  Msg {text Text}
 Rel Ev  *evs
 }
-(do
+(|
   full *evs = [(Ev.Ping {})  (Ev.Msg {text "hi"})]
   yield {})"#;
     let v2 = r#"with {
@@ -1415,14 +1415,14 @@ Rel EvV2  *evs
     Ev.Ping {}  (EvV2.Ping {})
     Ev.Msg {text t}  (EvV2.Msg {text t}))
 }
-(do
+(|
   yield {})"#;
     let committed = r#"with {
 Ev  Ping {}  Msg {text Text}
 EvV2  Ping {}  Msg {text Text}  Kick {}
 Rel EvV2  *evs
 }
-(do
+(|
   rows <- *evs
   base.println (base.show rows)
   yield {})"#;

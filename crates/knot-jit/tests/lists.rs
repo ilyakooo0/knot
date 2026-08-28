@@ -26,7 +26,7 @@ fn list_literal_container_polymorphism() {
         "Cons {head 1  tail Cons {head 2  tail Cons {head 3  tail Nil}}}",
     );
     // Iteration in a comprehension still works (binds as a relation).
-    assert_show("(do n <- [1  2  3]  yield (n * 2))", "[2, 4, 6]");
+    assert_show("(| n <- [1  2  3]  yield (n * 2))", "[2, 4, 6]");
 }
 
 #[test]

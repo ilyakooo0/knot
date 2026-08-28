@@ -760,7 +760,7 @@ fn render_expr_inline(e: &Expr, parent: Prec) -> String {
         }
         ExprKind::Do(stmts) => {
             // Inline `do {s1; s2}` form is rarely useful; keep it for one-liners.
-            let mut s = String::from("do ");
+            let mut s = String::from("| ");
             for (i, st) in stmts.iter().enumerate() {
                 if i > 0 {
                     s.push_str("; ");
@@ -1248,7 +1248,7 @@ fn render_do_block(p: &mut Printer, stmts: &[Stmt], parent: Prec) {
     if need_parens {
         p.write("(");
     }
-    p.write("do");
+    p.write("|");
     p.newline();
     p.with_indent(|p| {
         for (i, s) in stmts.iter().enumerate() {

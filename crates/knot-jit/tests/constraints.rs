@@ -13,7 +13,7 @@ Rel Person  *people
 Rel {customer Text  amount (Int 1)}  *orders
 *orders.customer <= *people.name
 }
-(do
+(|
   full *people = [{name "Alice"  age 30  email "a@x"}  {name "Bob"  age 25  email "b@x"}]
   full *orders = [{customer "Alice"  amount 100}]
   base.println (base.show (base.count *orders))
@@ -34,7 +34,7 @@ Rel Person  *people
 Rel {customer Text  amount (Int 1)}  *orders
 *orders.customer <= *people.name
 }
-(do
+(|
   full *people = [{name "Alice"  age 30  email "a@x"}]
   full *orders = [{customer "Nobody"  amount 100}]
   base.println "wrote"
@@ -65,7 +65,7 @@ Person  {name Text  email Text}
 Rel Person  *people
 *people <= *people.email
 }
-(do
+(|
   full *people = [{name "A"  email "dup@x"}  {name "B"  email "dup@x"}]
   base.println "wrote"
   yield {})"#,
@@ -89,7 +89,7 @@ fn morph_into_text_to_bytes() {
     // A direct call to the record's `into` field converts Text -> Bytes.
     assert_stdout(
         "morph_tb",
-        r#"(do
+        r#"(|
   base.println (base.show (base.morph.textToBytes.into "ab"))
   yield {})"#,
         "\"6162\"\n{}",
@@ -101,7 +101,7 @@ fn now_and_random_return_io() {
     // now/randomInt/randomUuid produce values; just check they run and show
     assert_stdout(
         "io_misc",
-        r#"(do
+        r#"(|
   t <- base.now
   r <- base.randomInt 100
   u <- base.randomUuid

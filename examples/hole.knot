@@ -17,7 +17,7 @@ with {
 --  caller supplies  positionally. `showInto From  x` shows  x at  type From.
 _  showInto  (\(Type  From) -> \x -> base.show x)
 }
-(do
+(|
   -- `_` as a TYPE ARGUMENT: inferred (here, from nothing constraining it to a
   -- concrete type, it stays polymorphic — same as passing an explicit type).
   -- The `_` is erased at runtime, exactly like an explicit `Int`/`Text`.
@@ -28,7 +28,7 @@ _  showInto  (\(Type  From) -> \x -> base.show x)
   yield {})
 
 -- `_` as a VALUE (uncomment to see the hole report):
--- (do
+-- (|
 --   base.println (base.show _)
 --   yield {})
 -- compiles with a "`todo` hole used" warning, and running it reports:

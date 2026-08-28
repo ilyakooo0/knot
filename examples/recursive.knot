@@ -3,11 +3,11 @@
 with {
 Rel {manager Text  report Text}  *manages
 
-directReports (do
+directReports (|
   m <- *manages
   yield {manager m.manager  report m.report})
 }
-(do
+(|
   full *manages = [
     {manager "Alice"  report "Bob"}
     {manager "Alice"  report "Carol"}

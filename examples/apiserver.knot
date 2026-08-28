@@ -49,7 +49,7 @@ nextId (\rows -> ? (rows)
   []  1
   Cons _ _  base.count rows + 1)
 
-addTask (\title owner -> do
+addTask (\title owner -> |
   rows <- *tasks
   with {id (nextId rows)}
     (*tasks = base.union rows [{id id  title title  owner owner  priority (Priority.Medium {})  done (Active.No {})}]))
@@ -57,20 +57,20 @@ addTask (\title owner -> do
 findById (\tid rows -> base.filter (\t -> t.id == tid) rows)
 
 srv (< Tasks
-  List = \{} -> do
+  List = \{} -> |
     rows <- *tasks
     yield (Result.Ok {value rows})
 
-  Get = \{id id} -> do
+  Get = \{id id} -> |
     rows <- *tasks
     yield (Result.Ok {value (findById id rows)})
 
-  Search = \{q q  limit limit} -> do
+  Search = \{q q  limit limit} -> |
     rows <- *tasks
     base.println ("search q=" ++ q ++ " limit=" ++ base.show limit)
     yield (Result.Ok {value rows})
 
-  Create = \{title title  owner owner} -> do
+  Create = \{title title  owner owner} -> |
     addTask title owner
     yield (Result.Ok {value {id 0  title title  owner owner  priority (Priority.Medium {})  done (Active.No {})}})
 
@@ -79,12 +79,12 @@ srv (< Tasks
     yield (Result.Ok {value {body {id 0  title title  owner owner  priority (Priority.Low {})  done (Active.No {})}
                              headers {xRequestId "req-echo-1"}}})
 
-  Audit = \{id id  authorization authorization} -> do
+  Audit = \{id id  authorization authorization} -> |
     base.println ("audit for task " ++ base.show id ++ " with auth " ++ authorization)
     rows <- *tasks
     yield (Result.Ok {value (findById id rows)})
 
-  Summary = \{} -> do
+  Summary = \{} -> |
     rows <- *tasks
     yield (Result.Ok {value (base.count rows)}))
 

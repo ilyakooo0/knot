@@ -13,7 +13,7 @@
 with {
 (<>logCtx) => Text -> IO {}  mylog  (\msg -> base.println (base.show ^logCtx ++ " | " ++ msg))
 }
-(do
+(|
     (with {logCtx {service "shop"}} (mylog "single"))
     (with {outer {logCtx {service "shop"}}} (
         with {logCtx {requestId 42}} (

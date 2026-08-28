@@ -10195,6 +10195,15 @@ impl Infer {
                 ty,
                 migrations,
             } => {
+                // Two source declarations with the same name are ambiguous —
+                // especially a relation `Rel T *n` alongside a single-value
+                // `T *n`, which disagree on the read/write shape.
+                if self.source_types.contains_key(name) {
+                    self.error(
+                        format!("source `*{name}` is declared more than once"),
+                        ty.span,
+                    );
+                }
                 self.annotation_vars.clear();
                 let resolved = self.ast_type_to_ty(ty);
                 // A source relation's element must be a record (or an ADT, which
@@ -10250,7 +10259,6 @@ impl Infer {
                     }
                 }
                 self.source_types.insert(name.to_string(), resolved.clone());
-
                 // Type-check the pending migration's migration fn as `Old -> New`.
                 // Deferred: the lambda needs the builtin data types (`Maybe`,
                 // `Bool`, `Result`) and stdlib in scope, which `pre_register`

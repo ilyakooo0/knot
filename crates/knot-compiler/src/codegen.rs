@@ -286,6 +286,9 @@ pub struct Codegen<M: cranelift_module::Module = ObjectModule> {
     // Scalar sources: source names whose type is a bare primitive (e.g. `*counter : Int 1`)
     // rather than a relation of records. These get automatic wrap/unwrap of `_value` field.
     scalar_sources: HashSet<String>,
+    /// Single-value sources (declared with a bare, non-`Rel` type). Writes wrap
+    /// the value as a one-row relation; reads unwrap it to the bare value.
+    single_value_sources: HashSet<String>,
 
     // Overridable constants: name -> type string ("Int", "Float", "Text", "Bool")
     overridable_constants: HashMap<String, String>,
@@ -897,6 +900,12 @@ fn compile_inner<M: cranelift_module::Module>(
         if schema.starts_with("_value:") {
             cg.scalar_sources.insert(name.clone());
         }
+        // A single-value source (declared with a bare, non-`Rel` type — e.g.
+        // `Person *owner`, `Int 1 *counter`) has a `{_value …}` schema: one
+        // wrapped value, not a relation of rows.
+        if schema.starts_with("{_value ") {
+            cg.single_value_sources.insert(name.clone());
+        }
     }
     cg.migrate_chains = crate::lockfile::committed_migrations(std::path::Path::new(source_file));
     cg.pending_targets = type_env.migrate_schemas.clone();
@@ -1461,6 +1470,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
             top_fn_names: HashSet::new(),
             ctor_value_closures: HashMap::new(),
             scalar_sources: HashSet::new(),
+            single_value_sources: HashSet::new(),
             overridable_constants: HashMap::new(),
             overridable_defaults: HashMap::new(),
             compile_time_overrides: HashMap::new(),
@@ -4959,9 +4969,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     "knot_source_read",
                     &[db, name_ptr, name_len, schema_ptr, schema_len],
                 );
-                if self.scalar_sources.contains(name) {
-                    // Scalar source: unwrap first row's _value field,
-                    // or return a default if the relation is empty.
+                if self.scalar_sources.contains(name) || self.single_value_sources.contains(name) {
+                    // Single-value source: unwrap the one row's `_value` field
+                    // back to the bare value (or a default if never written).
                     self.call_rt(builder, "knot_scalar_source_unwrap", &[rel])
                 } else {
                     rel
@@ -5801,8 +5811,11 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 if let ast::ExprKind::SourceRef { name, .. } = &target.node {
                     let schema = self.source_schemas.get(name).cloned().unwrap_or_default();
 
-                    // Scalar source: wrap value as [{_value: val}] and do a full write
-                    if self.scalar_sources.contains(name) {
+                    // Single-value source (`Person *owner`, `Int 1 *counter`):
+                    // wrap the bare value as a one-row `[{_value: val}]` relation
+                    // and write it. (`scalar_sources` are the scalar subset;
+                    // single-value covers records and ADTs too.)
+                    if self.scalar_sources.contains(name) || self.single_value_sources.contains(name) {
                         let val = self.compile_set_value_expr(builder, value, env, db);
                         // Validate refinements on the raw value (wrap as [val] for the check)
                         if self.source_refinements.contains_key(name) {
@@ -5959,8 +5972,11 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 if let ast::ExprKind::SourceRef { name, .. } = &target.node {
                     let schema = self.source_schemas.get(name).cloned().unwrap_or_default();
 
-                    // Scalar source: wrap value as [{_value: val}] and do a full write
-                    if self.scalar_sources.contains(name) {
+                    // Single-value source (`Person *owner`, `Int 1 *counter`):
+                    // wrap the bare value as a one-row `[{_value: val}]` relation
+                    // and write it. (`scalar_sources` are the scalar subset;
+                    // single-value covers records and ADTs too.)
+                    if self.scalar_sources.contains(name) || self.single_value_sources.contains(name) {
                         let val = self.compile_set_value_expr(builder, value, env, db);
                         // Validate refinements on the raw value (wrap as [val] for the check)
                         if self.source_refinements.contains_key(name) {

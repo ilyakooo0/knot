@@ -233,11 +233,14 @@ fn check_committed_using_types(old: &SchemaInfo, type_env: &TypeEnv) -> Vec<Diag
     // Data-type names declared in the current source (`Active` in
     // `Active.Yes {}`). A qualified ctor `Type.Ctor` references `Type`. ADT
     // names live in `aliases` (single-variant) and `multi_variant_params`.
+    // The builtin ADTs (`Maybe`, `Bool`, `Result`) are always in scope — a
+    // migration referencing `Maybe.Just` is not dangling.
     let declared: HashSet<&str> = type_env
         .aliases
         .keys()
         .map(String::as_str)
         .chain(type_env.multi_variant_params.keys().map(String::as_str))
+        .chain(["Maybe", "Bool", "Result"])
         .collect();
     let mut diags = Vec::new();
     for (source, chain) in &old.migrations {

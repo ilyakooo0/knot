@@ -1125,6 +1125,15 @@ struct Infer {
     /// when there is no lock or no pending migrations.
     migration_using_from: HashMap<String, String>,
 
+    /// Pending-migration checks deferred until builtins are registered. The
+    /// migration lambda is type-checked as `Old -> New` via `check_expr`, which
+    /// needs the builtin data types (`Maybe`, `Bool`, `Result`) and stdlib in
+    /// scope — but `collect_sources` runs before `pre_register` registers them.
+    /// Deferred here and drained after `pre_register`.
+    /// Each entry: (source name, from-type source, migration clause, resolved
+    /// source type).
+    pending_migration_checks: Vec<(String, String, ast::SourceMigration, Ty)>,
+
     /// Tracks `show` application sites so their argument's unit of measure can
     /// be resolved after inference. Each entry records (app_span, arg_ty); the
     /// arg type is recorded unresolved because a unit variable may only be
@@ -1428,6 +1437,7 @@ impl Infer {
             file_body_ty: None,
             from_json_calls: Vec::new(),
             migration_using_from: HashMap::new(),
+            pending_migration_checks: Vec::new(),
             show_calls: Vec::new(),
             known_impls: HashSet::new(),
             string_lit_vars: HashMap::new(),
@@ -10241,14 +10251,19 @@ impl Infer {
                 }
                 self.source_types.insert(name.to_string(), resolved.clone());
 
-                // Type-check the pending migration's migration fn as `Old -> New`:
-                // `Old` is the lock's recorded type (derived, never written in
-                // source); `New` is this source's element type. A wrong-shape
-                // migration is a compile error here, not a runtime abort after
-                // the migration has started writing.
+                // Type-check the pending migration's migration fn as `Old -> New`.
+                // Deferred: the lambda needs the builtin data types (`Maybe`,
+                // `Bool`, `Result`) and stdlib in scope, which `pre_register`
+                // registers — and `collect_sources` runs before it. Queue the
+                // check; `check_inner` drains it after `pre_register`.
                 if let Some(from_src) = self.migration_using_from.get(name).cloned() {
                     for m in migrations {
-                        self.check_migration_using(name, &from_src, m, &resolved);
+                        self.pending_migration_checks.push((
+                            name.to_string(),
+                            from_src.clone(),
+                            m.clone(),
+                            resolved.clone(),
+                        ));
                     }
                 }
             }
@@ -14444,6 +14459,14 @@ fn check_inner(
 
     // Phase 3: Pre-register top-level names (builtins, functions, trait methods)
     infer.pre_register(program);
+
+    // Drain the migration-fn checks deferred by `collect_sources`. They run
+    // after `pre_register` so the builtin data types (`Maybe`, `Bool`,
+    // `Result`) and stdlib are in scope for the migration lambda.
+    let pending = std::mem::take(&mut infer.pending_migration_checks);
+    for (name, from_src, m, resolved) in pending {
+        infer.check_migration_using(&name, &from_src, &m, &resolved);
+    }
 
     // Phase 4: Infer all declaration bodies
     infer.infer_declarations(program);

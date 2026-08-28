@@ -272,9 +272,61 @@ Int 1  n  10
 }
 (base.extract (\\x -> x + n))",
     );
+    assert_eq!(got, "with {n 10} (\\x -> x + n)");
+}
+
+/// Two captures: the env record's fields are gap-separated (2+ spaces) so the
+/// `with {a 1  b 2}` block re-parses. (Regression: single-space separators
+/// made a multi-capture closure's extract fail to re-parse.)
+#[test]
+fn extract_closure_two_captures_gap_separated() {
+    let got = crate::harness::eval_show(
+        "with {
+Int 1  a  1
+Int 1  b  2
+}
+(base.extract (\\x -> x + a + b))",
+    );
+    assert_eq!(got, "with {a 1  b 2} (\\x -> x + a + b)");
+}
+
+/// A closure nested in a record: the captured env rides along on the field.
+#[test]
+fn extract_record_with_closure_field() {
+    let got = crate::harness::eval_show(
+        "with {
+Int 1  n  3
+}
+(base.extract {f (\\x -> x + n)})",
+    );
+    assert_eq!(got, "{f with {n 3} (\\x -> x + n)}");
+}
+
+/// A relation of closures: a captured one and a bare one.
+#[test]
+fn extract_relation_of_closures() {
+    let got = crate::harness::eval_show(
+        "with {
+Int 1  n  1
+}
+(base.extract [(\\x -> x + n)  (\\x -> x)])",
+    );
+    assert_eq!(got, "[with {n 1} (\\x -> x + n) \\x -> x]");
+}
+
+/// A closure that captures a function value uses the sig'd field form
+/// (`_  name  body`) so the env block stays parseable.
+#[test]
+fn extract_closure_capturing_function() {
+    let got = crate::harness::eval_show(
+        "with {
+_  add  (\\a b -> a + b)
+}
+(base.extract (\\x -> add x 1))",
+    );
     assert!(
-        got.contains("n") && got.contains("10") && got.contains("\\x -> x + n"),
-        "closure extract carries the capture: {got}"
+        got.contains("add") && got.contains("_  add"),
+        "function capture uses the sig'd field form: {got}"
     );
 }
 

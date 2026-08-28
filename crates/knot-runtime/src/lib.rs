@@ -8505,7 +8505,7 @@ fn wrap_with_env(source: &str, env: *mut Value) -> String {
                 }
             })
             .collect();
-        format!("with {{{}}} ({})", inner.join(" "), source)
+        format!("with {{{}}} ({})", inner.join("  "), source)
     } else {
         // Non-record, non-null env. A Unit env is a 0-arity builtin (e.g. the
         // bare `Nothing`/`True` value fns) — no captured arg, emit the bare

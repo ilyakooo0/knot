@@ -12,6 +12,8 @@
 mod harness;
 use harness::assert_show;
 
+mod e2e;
+
 // ── Scalars ────────────────────────────────────────────────────────────────
 
 #[test]
@@ -352,4 +354,85 @@ fn extract_is_not_show() {
     // renderings.
     assert_show("base.extract \"hi\"", "\"hi\"");
     assert_show("base.show \"hi\"", "hi");
+}
+
+// ── Relations read from a real source ────────────────────────────────────────
+// extract of a *queried* relation (not a literal) — the data flows through
+// storage and back out.
+
+/// A relation read from a source extracts with name-sorted record fields.
+#[test]
+fn extract_relation_from_source() {
+    e2e::assert_stdout(
+        "extract_rel_src",
+        r#"with {
+V1  {name Text  age (Int 1)}
+Rel V1  *people
+}
+(|
+  full *people = [{name "a"  age 30}  {name "b"  age 25}]
+  rows <- *people
+  base.println (base.extract rows)
+  yield {})"#,
+        "\"[{age 30  name \"a\"} {age 25  name \"b\"}]\"\n{}",
+    );
+}
+
+/// A relation of user ADTs: each row carries the full `with {decl}` wrapper
+/// (self-contained per element — verbose but each re-parses standalone).
+#[test]
+fn extract_adt_relation_each_row_self_contained() {
+    e2e::assert_stdout(
+        "extract_adt_rel",
+        r#"with {
+Shape  Circle {radius (Float 1)}  Rect {w (Float 1)}
+Rel Shape  *shapes
+}
+(|
+  full *shapes = [(Shape.Circle {radius 1.5})  (Shape.Rect {w 2.0})]
+  rows <- *shapes
+  base.println (base.extract rows)
+  yield {})"#,
+        "\"[with {Shape  Circle {radius (Float 1)}  Rect {w (Float 1)}} (Shape.Circle {radius 1.5}) with {Shape  Circle {radius (Float 1)}  Rect {w (Float 1)}} (Shape.Rect {w 2.0})]\"\n{}",
+    );
+}
+
+// ── More scalar / text corners ───────────────────────────────────────────────
+
+/// Every Text escape in one value.
+#[test]
+fn extract_text_all_escapes() {
+    assert_show("base.extract \"a\\\"b\\\\c\\nd\\te\"", "\"a\\\"b\\\\c\\nd\\te\"");
+}
+
+/// A negative fractional Float.
+#[test]
+fn extract_float_negative_fraction() {
+    assert_show("base.extract (0.0 - 0.001)", "-0.001");
+}
+
+/// extract of an extracted Text: the Text is re-quoted (nested quoting).
+#[test]
+fn extract_of_extracted_text() {
+    // `base.extract 5` is the Text `5`; extracting that Text wraps it in
+    // quotes, giving the 3-char string `"5"`.
+    assert_show("base.extract (base.extract 5)", "\"5\"");
+}
+
+/// A many-field record sorts all fields by name.
+#[test]
+fn extract_record_many_fields_sorted() {
+    assert_show(
+        "base.extract {delta 4  alpha 1  charlie 3  bravo 2}",
+        "{alpha 1  bravo 2  charlie 3  delta 4}",
+    );
+}
+
+/// A Maybe holding a record, nested in a relation.
+#[test]
+fn extract_nested_maybe_record_in_relation() {
+    assert_show(
+        "base.extract [{m (Maybe.Just {value {x 1}})}]",
+        "[{m Maybe.Just {value {x 1}}}]",
+    );
 }

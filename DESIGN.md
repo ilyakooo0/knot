@@ -166,9 +166,9 @@ addMember \teamName person -> do
   teams <- full *teams
   *teams = do
     t <- teams
-    yield (case t.name == teamName of
-      Bool.True {} -> (base.unify t {members (base.union t.members [person])})
-      Bool.False {} -> t)
+    yield ((? (t.name == teamName)
+      Bool.True {}  (base.unify t {members (base.union t.members [person])})
+      Bool.False {}  t))
 
 -- Remove a member from all teams
 removePerson \personName -> do
@@ -291,7 +291,9 @@ richOnes \employees departments -> do
   yield (richOnes employees departments)
 
 -- do with Maybe
-safeDivide \a b -> case b == 0 of Bool.True {} -> Maybe.Nothing {}; Bool.False {} -> Maybe.Just {value (a / b)}
+safeDivide \a b -> (? (b == 0)
+  Bool.True {}  Maybe.Nothing {}
+  Bool.False {}  Maybe.Just {value (a / b)})
 
 tryCompute do
   x <- safeDivide 10 2
@@ -299,7 +301,9 @@ tryCompute do
   yield (x + y)
 
 -- do with Result
-safeDivideR \a b -> case b == 0 of Bool.True {} -> Result.Err {error "div by zero"}; Bool.False {} -> Result.Ok {value (a / b)}
+safeDivideR \a b -> (? (b == 0)
+  Bool.True {}  Result.Err {error "div by zero"}
+  Bool.False {}  Result.Ok {value (a / b)})
 
 computeR do
   x <- safeDivideR 10 2
@@ -334,7 +338,9 @@ These are built-in functions over relations plus the `*rel = expr` write. The co
 
 <!-- doccheck: skip — definitional illustration of a builtin's semantics (redefines a builtin/keyword; not a runnable program). -->
 ```knot-skip
-where \cond -> case cond of Bool.True {} -> yield {}; Bool.False {} -> empty
+where \cond -> (? (cond)
+  Bool.True {}  yield {}
+  Bool.False {}  empty)
 ```
 
 **`filter`** — filter rows:
@@ -404,7 +410,9 @@ deleteWhere \p -> do
 *rel : [{x: Int 1}]
 updateWhere \p f -> do
   rows <- full *rel
-  *rel = base.map (\x -> case p x of Bool.True {} -> f x; Bool.False {} -> x) rows
+  *rel = base.map (\x -> (? (p x)
+    Bool.True {}  f x
+    Bool.False {}  x) rows)
 ```
 
 **`count`**, **`sum`**, **`avg`** — folds:
@@ -524,18 +532,18 @@ scale \factor -> do
   shapes <- full *shapes
   *shapes = do
     s <- shapes
-    yield (case s of
-      Shape.Circle {radius r}       -> Shape.Circle {radius (r * factor)}
-      Shape.Rect {width w height h}  -> Shape.Rect {width (w * factor) height (h * factor)})
+    yield ((? (s)
+      Shape.Circle {radius r}  Shape.Circle {radius (r * factor)}
+      Shape.Rect {width w height h}  Shape.Rect {width (w * factor) height (h * factor)}))
 ```
 
 ### Pattern Matching on Relations
 
 ```knot
-describe \rel -> case rel of
-  [ ]          -> "empty"
-  [{name n}]   -> "just " ++ n
-  Cons h t     -> "first of many: " ++ base.show h.name
+describe \rel -> (? (rel)
+  [ ]          "empty"
+  [{name n}]   "just " ++ n
+  Cons h t     "first of many: " ++ base.show h.name)
 ```
 
 `[ ]` matches an empty relation. `[p1, p2, ...]` matches a relation with exactly that many rows in any iteration order. `Cons head tail` matches a non-empty relation, binding `head` to the first row and `tail` to the rest (the relation has no inherent order; `Cons` chooses a deterministic iteration order for the match).
@@ -657,7 +665,9 @@ birthday \name -> do
   people <- full *people
   *people = do
     p <- people
-    yield (case p.name == name of Bool.True {} -> (base.unify p {age (p.age + 1)}); Bool.False {} -> p)
+    yield ((? (p.name == name)
+      Bool.True {}  (base.unify p {age (p.age + 1)})
+      Bool.False {}  p))
 ```
 
 ### Effect Annotations
@@ -670,7 +680,9 @@ birthday \name -> do
   people <- full *people
   *people = do
     p <- people
-    yield (case p.name == name of Bool.True {} -> (base.unify p {age (p.age + 1)}); Bool.False {} -> p)
+    yield ((? (p.name == name)
+      Bool.True {}  (base.unify p {age (p.age + 1)})
+      Bool.False {}  p))
 ```
 
 ### IO and Transactions
@@ -764,9 +776,9 @@ knotFiles do
 -- Conditional read
 loadConfig \path -> do
   exists <- base.fileExists path
-  case exists of
-    Bool.True {} -> base.readFile path
-    Bool.False {} -> yield "{}"
+  (? (exists)
+    Bool.True {}  base.readFile path
+    Bool.False {}  yield "{}")
 ```
 
 ### Concurrency
@@ -852,9 +864,9 @@ fast do
 
 do
   r <- base.race slow fast
-  case r of
-    Result.Err {error a} -> base.println ("left won: " ++ a)
-    Result.Ok {value b}  -> base.println ("right won: " ++ b)
+  (? (r)
+    Result.Err {error a}  base.println ("left won: " ++ a)
+    Result.Ok {value b}  base.println ("right won: " ++ b))
   yield {}
 ```
 
@@ -909,9 +921,9 @@ assign \title owner person -> do
   todos <- full *todos
   *todos = do
     t <- todos
-    yield (case t.title == title of
-      Bool.True {} -> (base.unify t {owner person})
-      Bool.False {} -> t)
+    yield ((? (t.title == title)
+      Bool.True {}  (base.unify t {owner person})
+      Bool.False {}  t))
 
 pendingFor \user page limit -> do
   todos <- full *todos
@@ -945,17 +957,17 @@ route Api where
 api (< Api
   GetUser = \{id id} -> do
     users <- full *people
-    case base.filter (\u -> u.id == id) users of
-      [ ] -> yield (Result.Err {error {status 404 message "user not found"}})
-      Cons u rest -> yield (Result.Ok {value u})
+    (? (base.filter (\u -> u.id == id) users)
+      [ ]  yield (Result.Err {error {status 404 message "user not found"}})
+      Cons u rest  yield (Result.Ok {value u}))
   CreateUser = \{name name email email} -> do
-    case base.length name == 0 of
-      Bool.True {} -> yield (Result.Err {error {status 400 message "name required"}})
-      Bool.False {} -> do
-        atomic do
+    (? (base.length name == 0)
+      Bool.True {}  yield (Result.Err {error {status 400 message "name required"}})
+      Bool.False {}  (|
+        atomic |
           users <- full *people
           *people = base.union users [{id 0 name name email email}]
-        yield (Result.Ok {value {name name email email}}))
+        yield (Result.Ok {value {name name email email}})))
 ```
 
 Status codes are clamped to the range `100..=599`. Common codes: `400` (bad request), `401` (unauthorized), `403` (forbidden), `404` (not found), `409` (conflict), `500` (internal error). The runtime emits `400` automatically for path/query/body/header parsing failures and refinement violations, and `404` for unmatched routes — handlers only need to return `Err` for application-level errors.
@@ -1049,9 +1061,9 @@ byClientIp \input ctx -> Maybe.Just {value ctx.clientIp}
 
 byOwner \{owner owner} ctx -> Maybe.Just {value owner}      -- key by path/query/body field
 
-byApiKey \input ctx -> case ctx.header "Authorization" of
-  Maybe.Just {value k} -> Maybe.Just {value k}
-  Maybe.Nothing {} -> Maybe.Just {value ctx.clientIp}          -- fall back to IP
+byApiKey \input ctx -> (? (ctx.header "Authorization")
+  Maybe.Just {value k}  Maybe.Just {value k}
+  Maybe.Nothing {}  Maybe.Just {value ctx.clientIp})          -- fall back to IP
 
 route Api where
   GET /hello -> {message: Text}
@@ -1172,11 +1184,11 @@ transfer \from to amount -> do
   accounts <- full *accounts
   *accounts = do
     a <- accounts
-    yield (case a.name == from of
-      Bool.True {} -> (base.unify a {balance (a.balance - amount)})
-      Bool.False {} -> (case a.name == to of
-        Bool.True {} -> (base.unify a {balance (a.balance + amount)})
-        Bool.False {} -> a))
+    yield ((? (a.name == from)
+      Bool.True {}  (base.unify a {balance (a.balance - amount)})
+      Bool.False {}  ((? (a.name == to)
+        Bool.True {}  (base.unify a {balance (a.balance + amount)})
+        Bool.False {}  a))))
 
 batchTransfer \transfers ->
   base.map (\t -> atomic (transfer t.from t.to t.amount)) transfers
@@ -1201,7 +1213,9 @@ birthday \name -> do
   people <- full *people
   *people = do
     p <- people
-    yield (case p.name == "Alice" of Bool.True {} -> (base.unify p {age (p.age + 1)}); Bool.False {} -> p)
+    yield ((? (p.name == "Alice")
+      Bool.True {}  (base.unify p {age (p.age + 1)})
+      Bool.False {}  p))
 
 -- Delete: filter to keep the rest
 removePerson \name -> do
@@ -1445,7 +1459,9 @@ Functions can be generic over any ADT that has a particular variant:
 ```knot
 data Status = Open {} | Closed {}
 countOpen \rel ->
-  rel |> base.filter (\r -> case r.status of Status.Open {} -> Bool.True {}; other -> Bool.False {}) |> base.count
+  rel |> base.filter (\r -> (? (r.status)
+    Status.Open {}  Bool.True {}
+    other  Bool.False {})) |> base.count
 
 -- Inferred: works on tickets, issues, orders — anything with an Open status variant
 ```
@@ -1791,10 +1807,10 @@ showNat \n -> base.show n
 someInt (5 : Int 1)
 }
 (do
-  -- With case (Nat inferred from showNat's parameter):
-  case refine someInt of
-    Result.Ok {value n} -> base.println (showNat n)
-    Result.Err {error e} -> base.println "invalid"
+  -- With ? (Nat inferred from showNat's parameter):
+  (? (refine someInt)
+    Result.Ok {value n}  base.println (showNat n)
+    Result.Err {error e}  base.println "invalid")
   yield {})
 ```
 
@@ -1931,8 +1947,8 @@ mkPerson \n a e -> do
 
 api (< Api
   CreateUser = \{name name age age email email} ->
-    case mkPerson name age email of
-      Result.Ok {value person} -> do
+    (? (mkPerson name age email)
+      Result.Ok {value person}  do)
         atomic do
           people <- full *people
           *people = base.union people [person]
@@ -1981,7 +1997,11 @@ declares that the function needs a dictionary record providing `field` at type
 
 ```knot
 clamp : (^compare : a -> a -> Int 1) => a -> a -> a -> a
-clamp \lo hi x -> case ((^compare) x lo) < 0 of Bool.True {} -> lo; Bool.False {} -> case ((^compare) x hi) > 0 of Bool.True {} -> hi; Bool.False {} -> x
+clamp \lo hi x -> (? (((^compare) x lo) < 0)
+  Bool.True {}  lo
+  Bool.False {}  (? (((^compare) x hi) > 0)
+    Bool.True {}  hi
+    Bool.False {}  x))
 ```
 
 `clamp` is elaborated to take a hidden leading dictionary parameter (a record
@@ -1993,11 +2013,27 @@ type and splices it in as the leading argument:
 ```knot
 with {
 clamp : (^compare : a -> a -> Int 1) => a -> a -> a -> a
-clamp \lo hi x -> case ((^compare) x lo) < 0 of Bool.True {} -> lo; Bool.False {} -> case ((^compare) x hi) > 0 of Bool.True {} -> hi; Bool.False {} -> x
+clamp \lo hi x -> (? (((^compare) x lo) < 0)
+  Bool.True {}  lo
+  Bool.False {}  (? (((^compare) x hi) > 0)
+    Bool.True {}  hi
+    Bool.False {}  x))
 
-intOrd ({compare (\a b -> case a > b of Bool.True {} -> 1; Bool.False {} -> case a < b of Bool.True {} -> (0 - 1); Bool.False {} -> 0)})
-textOrd ({compare (\a b -> case a > b of Bool.True {} -> 1; Bool.False {} -> case a < b of Bool.True {} -> (0 - 1); Bool.False {} -> 0)})
-intOrdDesc ({compare (\a b -> case a < b of Bool.True {} -> 1; Bool.False {} -> case a > b of Bool.True {} -> (0 - 1); Bool.False {} -> 0)})
+intOrd ({compare (\a b -> (? (a > b)
+  Bool.True {}  1
+  Bool.False {}  (? (a < b)
+    Bool.True {}  (0 - 1)
+    Bool.False {}  0)))})
+textOrd ({compare (\a b -> (? (a > b)
+  Bool.True {}  1
+  Bool.False {}  (? (a < b)
+    Bool.True {}  (0 - 1)
+    Bool.False {}  0)))})
+intOrdDesc ({compare (\a b -> (? (a < b)
+  Bool.True {}  1
+  Bool.False {}  (? (a > b)
+    Bool.True {}  (0 - 1)
+    Bool.False {}  0)))})
 }
 (do
   base.println (base.show (clamp 0 10 42))           -- resolves to intOrd     → 10
@@ -2081,17 +2117,17 @@ assign \title owner person -> do
   todos <- full *todos
   *todos = do
     t <- todos
-    yield (case t.title == title && t.owner == owner of
-      Bool.True {} -> (base.unify t {status (Status.InProgress {assignee person})})
-      Bool.False {} -> t)
+    yield ((? (t.title == title && t.owner == owner)
+      Bool.True {}  (base.unify t {status (Status.InProgress {assignee person})})
+      Bool.False {}  t))
 
 resolve \title owner msg -> do
   todos <- full *todos
   *todos = do
     t <- todos
-    yield (case t.title == title && t.owner == owner of
-      Bool.True {} -> (base.unify t {status (Status.Resolved {resolution msg})})
-      Bool.False {} -> t)
+    yield ((? (t.title == title && t.owner == owner)
+      Bool.True {}  (base.unify t {status (Status.Resolved {resolution msg})})
+      Bool.False {}  t))
 
 api (< Api
   GetTodos = \{user user} -> do

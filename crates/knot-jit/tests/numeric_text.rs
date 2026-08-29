@@ -109,13 +109,6 @@ fn upsert_by_replaces_or_appends() {
 }
 
 #[test]
-fn single_maybe() {
-    assert_show("base.single [42]", "Just {value 42}");
-    assert_show("base.single []", "Nothing");
-    assert_show("base.single [1  2]", "Nothing"); // more than one
-}
-
-#[test]
 fn elem_membership() {
     assert_show("base.elem 2 [1  2  3]", "True");
     assert_show("base.elem 9 [1  2  3]", "False");

@@ -9,10 +9,7 @@ with {
 Account  {id (Int 1)  balance (Int 1)}
 Rel Account  *accounts
 
--- The `single (filter (\a -> a.id == ?) rows)`  pattern is  what the  codegen
---  recognizes as  a `"id" = ?`  simple equality;  inside an atomic  block the
---  runtime tracks  this as  a `Cols([(id, Eq, ?)])`  read filter  on accounts.
-_  findById  (\aid rows -> base.single (base.filter (\a -> a.id == aid) rows))
+_  findById  (\aid rows -> base.filter (\a -> a.id == aid) rows)
 
 _  setBalance  (\aid newBalance rows -> |
   r <- rows

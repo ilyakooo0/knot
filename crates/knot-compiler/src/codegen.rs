@@ -1769,9 +1769,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
         self.declare_rt("knot_relation_traverse", &[p, p, p], &[p]);
         self.declare_rt("knot_relation_traverse_kind", &[p, p, p, p, p], &[p]);
         self.declare_rt("knot_relation_for_each", &[p, p, p], &[p]);
-        self.declare_rt("knot_relation_head", &[p], &[p]);
-        self.declare_rt("knot_relation_find_first", &[p, p, p], &[p]);
-        self.declare_rt("knot_relation_single", &[p], &[p]);
         self.declare_rt("knot_relation_any", &[p, p, p], &[p]);
         self.declare_rt("knot_relation_all", &[p, p, p], &[p]);
         self.declare_rt("knot_relation_diff", &[p, p, p], &[p]);
@@ -2564,7 +2561,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
             "fold",
             "forEach",
             "filterCtor",
-            "single",
             "any",
             "all",
             "diff",
@@ -2574,8 +2570,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
             "minOn",
             "maxOn",
             "countWhere",
-            "head",
-            "findFirst",
             "distinct",
             // Relation query forms, registered as first-class function values
             // so they can live as fields of the `base` record (`base.count`,
@@ -3391,8 +3385,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
 
         // Define standard library functions
         // 1-param: direct delegation to runtime
-        self.define_stdlib_fn_1("single", "knot_relation_single");
-        self.define_stdlib_fn_1("head", "knot_relation_head");
         self.define_stdlib_fn_1("distinct", "knot_relation_dedup");
         self.define_stdlib_fn_1("toUpper", "knot_text_to_upper");
         self.define_stdlib_fn_1("toLower", "knot_text_to_lower");
@@ -3437,7 +3429,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
         self.define_stdlib_fn_2("filter", "knot_relation_filter", true);
         self.define_stdlib_fn_2("map", "knot_relation_map", true);
         self.define_stdlib_fn_2("forEach", "knot_relation_for_each", true);
-        self.define_stdlib_fn_2("findFirst", "knot_relation_find_first", true);
         self.define_stdlib_fn_3_rel("fold", "knot_relation_fold");
         self.define_stdlib_fn_2("traverse", "knot_relation_traverse", true);
         self.define_stdlib_fn_2("take", "knot_take", false);
@@ -6581,218 +6572,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
     /// or None to fall back to in-memory. `pred_lambda` is findFirst's
     /// predicate (None for head); it is AND-ed into the WHERE clause.
     /// Handles bare `*src`, `filter p *src`, and do-block sources. Bails on
-    /// views, ADT/nested schemas, multi-table plans, and untranslatable exprs.
-    fn build_first_row_query(
-        &mut self,
-        rel_expr: &ast::Expr,
-        pred_lambda: Option<&ast::Expr>,
-        env: &mut Env,
-        builder: &mut FunctionBuilder,
-        db: Value,
-    ) -> Option<Value> {
-        // `head (map (\r -> r.f) src)` / `src |> map (\r -> r.f) |> head`:
-        // select only the projected column and return the 1-col schema. Peel
-        // the map, then build the first-row query over the inner source with
-        // the projection applied. Only single-column field projections (the
-        // shape `peel_map_projection` recognizes); anything richer falls back.
-        let map_peel = self.peel_map_projection(rel_expr);
-        if let Some((map_src, map_field)) = &map_peel
-            && let Some(base_schema) = self.source_schemas.get(map_src).cloned()
-            && !base_schema.starts_with('#')
-            && !base_schema.contains('[')
-            && let Some(type_str) = lookup_col_type_from_schema(&base_schema, map_field)
-        {
-            let select_columns = vec![SqlSelectColumn {
-                result_field: map_field.clone(),
-                alias: String::new(),
-                source_col: map_field.clone(),
-                type_str: type_str.clone(),
-                sql_expr: None,
-            }];
-            let proj_schema = format!("{}:{}", map_field, type_str);
-            let plan = SqlQueryPlan {
-                tables: vec![SqlTable {
-                    source_name: map_src.clone(),
-                    alias: String::new(),
-                    subquery: None,
-                }],
-                conditions: Vec::new(),
-                params: Vec::new(),
-                select_columns,
-                order_by: Vec::new(),
-                limit: Some(SqlParamSource::Literal(
-                    ast::Literal::Int("1".to_string()),
-                    ast::Span::new(0, 0),
-                )),
-                offset: None,
-                distinct: false,
-                group_by: Vec::new(),
-                having: Vec::new(),
-            };
-            let query = Query {
-                plan,
-                terminal: QueryTerminal::Rows,
-            };
-            return Some(self.emit_query(
-                builder,
-                &query,
-                &proj_schema,
-                env,
-                db,
-                None,
-                Some(rel_expr.span),
-            ));
-        }
-        // Resolve the source to (plan, schema). Two shapes: a bare/`filter`
-        // source (single table, optional WHERE) or a do-block plan.
-        let (mut plan, schema): (SqlQueryPlan, String) = if let ast::ExprKind::Do(stmts) =
-            &rel_expr.node
-        {
-            let plan = self.analyze_sql_plan(stmts, env)?;
-            if plan.tables.len() != 1 || plan.limit.is_some() || plan.offset.is_some() {
-                return None;
-            }
-            let schema = self
-                .source_schemas
-                .get(&plan.tables[0].source_name)?
-                .clone();
-            (plan, schema)
-        } else {
-            // Bare `*src`, `filter p *src`, or `sortBy k *src`. Peel a
-            // leading `sortBy` into ORDER BY (the key must be a single
-            // column access, matching the standalone sortBy pushdown's
-            // pushability rule), then treat the remainder as a bare or
-            // filtered source.
-            let reduced = beta_reduce(rel_expr, &self.fun_bodies, &self.let_bindings);
-            let (order_by, base): (Vec<String>, ast::Expr) =
-                match peel_sort_by(&reduced, &self.fun_bodies, &self.let_bindings) {
-                    Some((key_lam, inner, desc)) => {
-                        let (key_bind, key_body) = extract_single_param_lambda(
-                            &key_lam,
-                            &self.fun_bodies,
-                            &self.let_bindings,
-                        )?;
-                        let key_body: &ast::Expr = &key_body;
-                        // Resolve the inner source's schema for the key
-                        // column; sortBy over a filter keeps the filter's
-                        // source. Use the inner source's own schema.
-                        let inner_src = match extract_filter_on_source(
-                            &inner,
-                            &self.source_var_binds,
-                            &self.fun_bodies,
-                            &self.let_bindings,
-                        ) {
-                            Some((s, _, _)) => s,
-                            None => self.resolve_source(&inner)?,
-                        };
-                        let inner_schema = self.source_schemas.get(&inner_src)?.clone();
-                        if !sortby_projection_pushable(&key_bind, key_body, &inner_schema) {
-                            return None;
-                        }
-                        let col_sql =
-                            extract_sql_field_access(&key_bind, key_body, "", &inner_schema)?;
-                        let col_sql = if desc {
-                            format!("{} DESC", col_sql)
-                        } else {
-                            col_sql
-                        };
-                        (vec![col_sql], inner)
-                    }
-                    None => (Vec::new(), rel_expr.clone()),
-                };
-            let reduced_base = beta_reduce(&base, &self.fun_bodies, &self.let_bindings);
-            // Peel a leading take/drop around the source. `head (drop N …)`
-            // becomes `LIMIT 1 OFFSET N`. `head (take N …)` must keep the
-            // take's bound as the LIMIT: `take 0`/negative yields an empty
-            // page (so head → Nothing), and a positive take keeps at least
-            // the first row — head then reads the first of the ≤N rows.
-            let (offset, take, base_no_take): (Option<ast::Expr>, Option<ast::Expr>, ast::Expr) =
-                match peel_take_drop(&reduced_base, &self.fun_bodies, &self.let_bindings) {
-                    Some((true, n, inner)) => (Some(n), None, inner),
-                    Some((false, n, inner)) => (None, Some(n), inner),
-                    None => (None, None, reduced_base.clone()),
-                };
-            let offset_param = match &offset {
-                Some(n) => Some(expr_to_sql_param(n)?),
-                None => None,
-            };
-            let take_param = match &take {
-                Some(n) => Some(expr_to_sql_param(n)?),
-                None => None,
-            };
-            let base_reduced = beta_reduce(&base_no_take, &self.fun_bodies, &self.let_bindings);
-            let (source_name, filter): (String, Option<(String, ast::Expr)>) =
-                match extract_filter_on_source(
-                    &base_reduced,
-                    &self.source_var_binds,
-                    &self.fun_bodies,
-                    &self.let_bindings,
-                ) {
-                    Some((src, bind, body)) => (src, Some((bind, body))),
-                    None => (self.resolve_source(&base_reduced)?, None),
-                };
-            let schema = self.source_schemas.get(&source_name)?.clone();
-            if schema.starts_with('#') || schema.contains('[') {
-                return None;
-            }
-            let alias = String::new(); // bare FROM, unqualified cols
-            let mut conditions = Vec::new();
-            let mut params = Vec::new();
-            if let Some((bind, body)) = filter {
-                let body: &ast::Expr = &body;
-                let frag = self.try_compile_sql_expr(&bind, body, &schema)?;
-                conditions.push(frag.sql);
-                params.extend(frag.params);
-            }
-            (
-                SqlQueryPlan {
-                    tables: vec![SqlTable {
-                        source_name,
-                        alias,
-                        subquery: None,
-                    }],
-                    conditions,
-                    params,
-                    select_columns: schema_select_columns(&schema, ""),
-                    order_by,
-                    // A peeled `take N` sets the page bound (`take 0` →
-                    // empty → Nothing); otherwise head uses LIMIT 1 below.
-                    limit: take_param,
-                    offset: offset_param,
-                    distinct: false,
-                    group_by: Vec::new(),
-                    having: Vec::new(),
-                },
-                schema,
-            )
-        };
-
-        // AND findFirst's predicate into the WHERE (single table → alias t0).
-        if let Some(lam) = pred_lambda {
-            let (bind, body) =
-                extract_single_param_lambda(lam, &self.fun_bodies, &self.let_bindings)?;
-            let body: &ast::Expr = &body;
-            let frag = self.try_compile_sql_expr(&bind, body, &schema)?;
-            plan.conditions.push(frag.sql);
-            plan.params.extend(frag.params);
-        }
-
-        // LIMIT 1 as a literal — no runtime param needed. A peeled `take N`
-        // already set the bound above (`take 0` → empty → Nothing); only the
-        // bare case needs the explicit 1.
-        if plan.limit.is_none() {
-            plan.limit = Some(SqlParamSource::Literal(
-                ast::Literal::Int("1".to_string()),
-                ast::Span::new(0, 0),
-            ));
-        }
-        let query = Query {
-            plan,
-            terminal: QueryTerminal::Rows,
-        };
-        Some(self.emit_query(builder, &query, &schema, env, db, None, Some(rel_expr.span)))
-    }
-
+ 
     /// Does this argument expression have a Π-lite type-argument head? Only the
     /// LEFTMOST head of the arg's application spine counts: `App(Int, x)` has
     /// type head `Int`, but `App(f, App(Int, x))` (a complete call passed as an
@@ -7666,195 +7446,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
             }
         }
 
-        // Special case: single *rel / single (filter f *rel) / single (do {...}) → LIMIT 2
-        if let ast::ExprKind::Var(name) = &func_expr.node
-            && name == "single"
-            && args.len() == 1
-            && !user_shadows_special
-        {
-            // single *source → SELECT ... LIMIT 2 then knot_relation_single
-            if let Some(source_name) = self.resolve_source(args[0])
-                && let Some(schema) = self.source_schemas.get(&source_name).cloned()
-                && !schema.starts_with('#')
-                && !schema.contains('[')
-            {
-                let table = quote_sql_ident(&format!("_knot_{}", source_name));
-                let cols = parse_schema_columns(&schema)
-                    .iter()
-                    .map(|(name, _)| quote_sql_ident(name))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let sql = format!("SELECT {} FROM {} LIMIT 2", cols, table);
-                let params_rel = self.compile_sql_params(builder, &[], env, db);
-                let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
-                let (schema_ptr, schema_len) = self.string_ptr(builder, &schema);
-                let (tn_ptr, tn_len) = self.string_ptr(builder, &source_name);
-                self.call_rt_void(builder, "knot_stm_track_read", &[tn_ptr, tn_len]);
-                let rel = self.call_rt(
-                    builder,
-                    "knot_source_query",
-                    &[db, sql_ptr, sql_len, schema_ptr, schema_len, params_rel],
-                );
-                return self.call_rt(builder, "knot_relation_single", &[rel]);
-            }
 
-            // single (filter f *source) → SELECT ... WHERE ... LIMIT 2
-            if let Some((source_name, filter_bind, filter_body)) = extract_filter_on_source(
-                args[0],
-                &self.source_var_binds,
-                &self.fun_bodies,
-                &self.let_bindings,
-            ) {
-                let filter_body: &ast::Expr = &filter_body;
-                if let Some(schema) = self.source_schemas.get(&source_name).cloned()
-                    && !schema.starts_with('#')
-                    && !schema.contains('[')
-                    && let Some(frag) =
-                        self.try_compile_sql_expr(&filter_bind, filter_body, &schema)
-                {
-                    let table = quote_sql_ident(&format!("_knot_{}", source_name));
-                    let cols = parse_schema_columns(&schema)
-                        .iter()
-                        .map(|(name, _)| quote_sql_ident(name))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    let sql = format!("SELECT {} FROM {} WHERE {} LIMIT 2", cols, table, frag.sql);
-                    let preds = try_extract_field_preds(&filter_bind, filter_body);
-                    let params_rel = self.compile_sql_params(builder, &frag.params, env, db);
-                    let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
-                    let (schema_ptr, schema_len) = self.string_ptr(builder, &schema);
-                    let (tn_ptr, tn_len) = self.string_ptr(builder, &source_name);
-                    self.call_rt_void(builder, "knot_stm_track_read", &[tn_ptr, tn_len]);
-                    self.emit_stm_track_pred(builder, tn_ptr, tn_len, &preds, env, db);
-                    let rel = self.call_rt(
-                        builder,
-                        "knot_source_query",
-                        &[db, sql_ptr, sql_len, schema_ptr, schema_len, params_rel],
-                    );
-                    return self.call_rt(builder, "knot_relation_single", &[rel]);
-                }
-            }
-
-            // single (do { x <- *source; where ...; yield x }) → SQL plan + LIMIT 2
-            // See through a `with {lim: e, …} (do …)` wrapper: the fields are
-            // pure bindings (old `let`) that the SQL planner resolves as
-            // params, so register them in `let_bindings` around the plan.
-            let single_arg = &args[0];
-            let (plan_stmts, with_overlay): (&[ast::Stmt], Vec<(String, ast::Expr)>) =
-                match &single_arg.node {
-                    ast::ExprKind::Do(stmts) => (stmts, Vec::new()),
-                    ast::ExprKind::With { record, body, .. }
-                        if matches!(&body.node, ast::ExprKind::Do(_)) =>
-                    {
-                        let overlay = if let ast::ExprKind::Record(fes) = &record.node {
-                            fes.iter()
-                                .map(|f| (f.name.expect_named().to_string(), f.value.clone()))
-                                .collect()
-                        } else {
-                            Vec::new()
-                        };
-                        if let ast::ExprKind::Do(stmts) = &body.node {
-                            (stmts, overlay)
-                        } else {
-                            unreachable!()
-                        }
-                    }
-                    _ => (&[], Vec::new()),
-                };
-            let mut overlay_added: Vec<String> = Vec::new();
-            for (n, v) in &with_overlay {
-                if !self.let_bindings.contains_key(n) {
-                    self.let_bindings.insert(n.clone(), v.clone());
-                    overlay_added.push(n.clone());
-                }
-                // Also bind the field's VALUE into `env` so SQL params that
-                // reference it (`where t.a == lim`) resolve at runtime — the
-                // old `let lim = 1` bound `lim` as an ordinary local.
-                let val = self.compile_expr(builder, v, env, db);
-                env.set(crate::infer::Binding::User(n.clone()), val);
-            }
-            let plan_result = if !plan_stmts.is_empty() {
-                self.analyze_sql_plan(plan_stmts, env)
-            } else {
-                None
-            };
-            if let Some(plan) = plan_result {
-                let mut sql = plan.build_sql();
-                sql.push_str(" LIMIT 2");
-                self.debug_sql(Some(expr.span), &sql);
-                let result_schema = plan.build_result_schema();
-                let preds = try_extract_preds_for_single_table_plan(plan_stmts, &plan);
-                let params_rel = self.compile_sql_params(builder, &plan.params, env, db);
-                for table in &plan.tables {
-                    let (tn_ptr, tn_len) = self.string_ptr(builder, &table.source_name);
-                    self.call_rt_void(builder, "knot_stm_track_read", &[tn_ptr, tn_len]);
-                    if plan.tables.len() == 1 {
-                        self.emit_stm_track_pred(builder, tn_ptr, tn_len, &preds, env, db);
-                    }
-                }
-                let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
-                let (schema_ptr, schema_len) = self.string_ptr(builder, &result_schema);
-                let rel = self.call_rt(
-                    builder,
-                    "knot_source_query",
-                    &[db, sql_ptr, sql_len, schema_ptr, schema_len, params_rel],
-                );
-                let out = self.call_rt(builder, "knot_relation_single", &[rel]);
-                for n in &overlay_added {
-                    self.let_bindings.remove(n);
-                }
-                return out;
-            }
-            for n in &overlay_added {
-                self.let_bindings.remove(n);
-            }
-        }
-
-        // head / findFirst over a source relation → SELECT … LIMIT 1, then take
-        // the first row as a `Maybe`. Without this the whole relation is
-        // materialized just to read one row. Mirrors the `single` pushdown
-        // (which uses LIMIT 2 to distinguish singleton from multi); head only
-        // needs LIMIT 1.
-        //   head *src                    → SELECT cols FROM t LIMIT 1
-        //   head (filter p *src)         → SELECT cols FROM t WHERE p LIMIT 1
-        //   findFirst *src p             → same as head (filter p *src)
-        //   head/findFirst (do/sortBy …) → plan + ORDER BY/WHERE … LIMIT 1
-        // Match both bare `head`/`findFirst` and the `base.`-qualified forms,
-        // positively identified via the resolution table (no false positive
-        // when a user binding shadows the name).
-        let head_pushdown_name: Option<&str> = match &func_expr.node {
-            ast::ExprKind::Var(name)
-                if (name == "head" || name == "findFirst")
-                    && !user_shadows_special
-                    && !self.resolves_to_user(func_expr) =>
-            {
-                Some(name.as_str())
-            }
-            ast::ExprKind::FieldAccess { expr, field }
-                if (field == "head" || field == "findFirst")
-                    && matches!(&expr.node, ast::ExprKind::Var(n) if n == "base")
-                    && crate::infer::StdlibFn::from_name(field)
-                        .is_some_and(|sf| self.resolves_to_stdlib(func_expr, sf)) =>
-            {
-                Some(field.as_str())
-            }
-            _ => None,
-        };
-        if let Some(name) = head_pushdown_name {
-            // Normalize to (source_expr, Option<predicate_lambda>). head has
-            // no predicate; findFirst's second arg is the predicate.
-            let normalized: Option<(&ast::Expr, Option<&ast::Expr>)> = match name {
-                "head" if args.len() == 1 => Some((args[0], None)),
-                "findFirst" if args.len() == 2 => Some((args[0], Some(args[1]))),
-                _ => None, // arity mismatch: fall through to the generic call path
-            };
-            if let Some((rel_expr, pred_lambda)) = normalized
-                && let Some(query) =
-                    self.build_first_row_query(rel_expr, pred_lambda, env, builder, db)
-            {
-                return self.call_rt(builder, "knot_relation_head", &[query]);
-            }
-        }
 
         // Special case: fold f init <relation expression> → stream rows from SQLite
         // one-by-one through the fold function instead of materializing the whole
@@ -18667,39 +18259,6 @@ fn peel_take_drop(
         && let Some(is_drop) = is_take_drop(name_expr)
     {
         return Some((is_drop, (**n).clone(), (**lhs).clone()));
-    }
-    None
-}
-
-/// Peel `sortBy key_lambda source` (bare or `base.sortBy`) into
-/// `(key_lambda, source)`, after full inlining. Returns None for any other
-/// shape. Owned because inlining may synthesize new sub-expressions. Used by
-/// pushdowns that turn a leading `sortBy` into an ORDER BY without
-/// materializing the whole relation.
-fn peel_sort_by(
-    expr: &ast::Expr,
-    fun_bodies: &HashMap<String, ast::Expr>,
-    let_bindings: &HashMap<String, ast::Expr>,
-) -> Option<(ast::Expr, ast::Expr, bool)> {
-    let reduced = beta_reduce(expr, fun_bodies, let_bindings);
-    if let ast::ExprKind::App { func, arg: source } = reduced.node
-        && let ast::ExprKind::App {
-            func: name_expr,
-            arg: key_lambda,
-        } = func.node
-    {
-        let name = match &name_expr.node {
-            ast::ExprKind::Var(n) => Some(n.as_str()),
-            ast::ExprKind::FieldAccess { expr, field } if matches!(&expr.node, ast::ExprKind::Var(n) if n == "base") => {
-                Some(field.as_str())
-            }
-            _ => None,
-        };
-        match name {
-            Some("sortBy") => return Some((*key_lambda, *source, false)),
-            Some("sortByDesc") => return Some((*key_lambda, *source, true)),
-            _ => {}
-        }
     }
     None
 }

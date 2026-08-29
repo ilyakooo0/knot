@@ -173,11 +173,9 @@ pub enum StdlibFn {
     SortByDesc,
     Take,
     Drop,
-    FindFirst,
     Any,
     All,
     Elem,
-    Head,
 }
 
 impl StdlibFn {
@@ -197,11 +195,9 @@ impl StdlibFn {
             "sortByDesc" => StdlibFn::SortByDesc,
             "take" => StdlibFn::Take,
             "drop" => StdlibFn::Drop,
-            "findFirst" => StdlibFn::FindFirst,
             "any" => StdlibFn::Any,
             "all" => StdlibFn::All,
             "elem" => StdlibFn::Elem,
-            "head" => StdlibFn::Head,
             _ => return None,
         })
     }
@@ -11609,43 +11605,6 @@ impl Infer {
             ),
         );
 
-        // head : ∀a. [a] -> Maybe a  (builtin → knot_relation_head).
-        // Relation-FIRST arg order. First element as `Just {value: x}`, or
-        // `Nothing {}` on the empty relation.
-        {
-            let a = self.fresh_var();
-            self.bind_top(
-                "head",
-                Scheme::poly(
-                    vec![a],
-                    Ty::Fun(
-                        Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
-                        Box::new(Ty::Con("Maybe".into(), vec![Ty::Var(a)])),
-                    ),
-                ),
-            );
-        }
-
-        // findFirst : ∀a. [a] -> (a -> Bool) -> Maybe a  (builtin →
-        // knot_relation_find_first). Relation-FIRST arg order. First row
-        // satisfying `pred` as `Just {value: x}`, else `Nothing {}`.
-        {
-            let a = self.fresh_var();
-            self.bind_top(
-                "findFirst",
-                Scheme::poly(
-                    vec![a],
-                    Ty::Fun(
-                        Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
-                        Box::new(Ty::Fun(
-                            Box::new(Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Bool))),
-                            Box::new(Ty::Con("Maybe".into(), vec![Ty::Var(a)])),
-                        )),
-                    ),
-                ),
-            );
-        }
-
         // ── List ADT builtins (`base.list.*`) ─────────────────────────────
         // Runtime-implemented (knot_list_*); the prelude record can't
         // self-reference for recursion, so these are codegen builtins. Names
@@ -11852,19 +11811,6 @@ impl Infer {
                 ),
             );
         }
-
-        // single : ∀a. [a] -> Maybe a
-        let a = self.fresh_var();
-        self.bind_top(
-            "single",
-            Scheme::poly(
-                vec![a],
-                Ty::Fun(
-                    Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
-                    Box::new(Ty::Con("Maybe".into(), vec![Ty::Var(a)])),
-                ),
-            ),
-        );
 
         // any : ∀a. (a -> Bool) -> [a] -> Bool
         {

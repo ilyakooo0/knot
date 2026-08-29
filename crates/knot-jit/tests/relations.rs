@@ -169,26 +169,6 @@ fn any_all() {
     assert_show("base.all (\\n -> n > 1) [1  2  3]", "False");
 }
 
-#[test]
-fn single_row() {
-    assert_show("base.single [7]", "Just {value 7}");
-}
-
-#[test]
-fn single_empty_or_many() {
-    // Nullary constructors show without a payload: `Nothing`, not `Nothing {}`.
-    assert_show("base.single (base.the (Rel (Int 1)) [])", "Nothing");
-    assert_show("base.single [1  2]", "Nothing");
-}
-
-#[test]
-fn head_findfirst() {
-    // Constructor payloads show with `: ` separators (field-style).
-    assert_show("base.head [5  6]", "Just {value 5}");
-    // findFirst is relation-FIRST: [a] -> (a -> Bool) -> Maybe a.
-    assert_show("base.findFirst [1  2  3] (\\n -> n > 1)", "Just {value 2}");
-}
-
 // ── ordering / slicing (sorted relations have a fixed iteration order) ───
 
 #[test]

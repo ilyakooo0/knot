@@ -95,7 +95,7 @@ fn count_empty() {
 
 #[test]
 fn count_where() {
-    assert_show("base.countWhere (\\n -> n % 2 == 0) [1  2  3  4  5  6]", "3");
+    assert_show("base.countWhere (\\n -> n % 2 == 0) [1  2  3  4  5  6]", "[3]");  // countWhere is a one-element relation now
 }
 
 #[test]

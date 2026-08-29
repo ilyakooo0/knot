@@ -2198,7 +2198,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
             let db = builder.block_params(entry)[0];
             let rel = builder.block_params(entry)[1];
             let is_float = builder.ins().iconst(types::I64, 0);
-            let result = cg.call_rt(builder, "knot_relation_sum_direct", &[db, rel, is_float]);
+            let n = cg.call_rt(builder, "knot_relation_sum_direct", &[db, rel, is_float]);
+            // sum : Rel a -> Rel a — a one-element relation.
+            let result = cg.call_rt(builder, "knot_relation_singleton", &[n]);
             builder.ins().return_(&[result]);
         });
     }
@@ -2304,6 +2306,17 @@ impl<M: cranelift_module::Module> Codegen<M> {
     /// outer(db, arg1) -> Function(inner, arg1, name)  — arg1 passed directly as env
     /// inner(db, env=arg1, arg2) -> rt_fn(db, arg1, arg2)
     fn define_stdlib_fn_2(&mut self, name: &str, rt_name: &str, rt_needs_db: bool) {
+        self.define_stdlib_fn_2_wrap(name, rt_name, rt_needs_db, false);
+    }
+
+    /// Like `define_stdlib_fn_2`, but wraps the scalar result in a one-element
+    /// relation (for the scalar aggregates — sum/avg/minOn/maxOn/countWhere —
+    /// whose result is a `Rel <scalar>`).
+    fn define_stdlib_fn_2_rel(&mut self, name: &str, rt_name: &str, rt_needs_db: bool) {
+        self.define_stdlib_fn_2_wrap(name, rt_name, rt_needs_db, true);
+    }
+
+    fn define_stdlib_fn_2_wrap(&mut self, name: &str, rt_name: &str, rt_needs_db: bool, wrap_singleton: bool) {
         // Stdlib fns are always under the flattened `base.<name>` key — no
         // shadow branch; the bare name is the user's alone.
         let inner_id = self.declare_closure_fn(&format!("__stdlib_{}_apply", name));
@@ -2349,6 +2362,11 @@ impl<M: cranelift_module::Module> Codegen<M> {
             } else {
                 cg.call_rt(builder, &rt_name, &[arg1, arg2])
             };
+            let result = if wrap_singleton {
+                cg.call_rt(builder, "knot_relation_singleton", &[result])
+            } else {
+                result
+            };
             builder.ins().return_(&[result]);
         });
     }
@@ -2358,6 +2376,16 @@ impl<M: cranelift_module::Module> Codegen<M> {
     /// middle(db, {arg1}, arg2) -> Function(inner, {arg1, arg2})
     /// inner(db, {arg1, arg2}, arg3) -> rt_fn(db, arg1, arg2, arg3)
     fn define_stdlib_fn_3(&mut self, name: &str, rt_name: &str) {
+        self.define_stdlib_fn_3_wrap(name, rt_name, false);
+    }
+
+    /// Like `define_stdlib_fn_3`, but wraps the scalar result in a one-element
+    /// relation (for `fold`, whose result is a `Rel b`).
+    fn define_stdlib_fn_3_rel(&mut self, name: &str, rt_name: &str) {
+        self.define_stdlib_fn_3_wrap(name, rt_name, true);
+    }
+
+    fn define_stdlib_fn_3_wrap(&mut self, name: &str, rt_name: &str, wrap_singleton: bool) {
         // Stdlib fns are always under the flattened `base.<name>` key — no
         // shadow branch; the bare name is the user's alone.
         let middle_id = self.declare_closure_fn(&format!("__stdlib_{}_mid", name));
@@ -2450,6 +2478,11 @@ impl<M: cranelift_module::Module> Codegen<M> {
             let arg2 = cg.call_rt(builder, "knot_record_field_by_index", &[env, idx1]);
 
             let result = cg.call_rt(builder, &rt_name, &[db, arg1, arg2, arg3]);
+            let result = if wrap_singleton {
+                cg.call_rt(builder, "knot_relation_singleton", &[result])
+            } else {
+                result
+            };
             builder.ins().return_(&[result]);
         });
     }
@@ -3405,7 +3438,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
         self.define_stdlib_fn_2("map", "knot_relation_map", true);
         self.define_stdlib_fn_2("forEach", "knot_relation_for_each", true);
         self.define_stdlib_fn_2("findFirst", "knot_relation_find_first", true);
-        self.define_stdlib_fn_3("fold", "knot_relation_fold");
+        self.define_stdlib_fn_3_rel("fold", "knot_relation_fold");
         self.define_stdlib_fn_2("traverse", "knot_relation_traverse", true);
         self.define_stdlib_fn_2("take", "knot_take", false);
         self.define_stdlib_fn_2("drop", "knot_drop", false);
@@ -3426,10 +3459,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
         self.define_stdlib_fn_1("valueNegate", "knot_value_negate");
         self.define_stdlib_fn_2("union", "knot_relation_union", true);
         self.define_stdlib_fn_2("bind", "knot_relation_bind", true);
-        self.define_stdlib_fn_2("avg", "knot_relation_avg", true);
-        self.define_stdlib_fn_2("minOn", "knot_relation_min", true);
-        self.define_stdlib_fn_2("maxOn", "knot_relation_max", true);
-        self.define_stdlib_fn_2("countWhere", "knot_relation_count_where", true);
+        self.define_stdlib_fn_2_rel("avg", "knot_relation_avg", true);
+        self.define_stdlib_fn_2_rel("minOn", "knot_relation_min", true);
+        self.define_stdlib_fn_2_rel("maxOn", "knot_relation_max", true);
+        self.define_stdlib_fn_2_rel("countWhere", "knot_relation_count_where", true);
         self.define_stdlib_fn_2("any", "knot_relation_any", true);
         self.define_stdlib_fn_2("all", "knot_relation_all", true);
 
@@ -8914,11 +8947,13 @@ impl<M: cranelift_module::Module> Codegen<M> {
             let is_float = builder
                 .ins()
                 .iconst(types::I64, self.sum_float_spans.contains(&expr.span) as i64);
-            return self.call_rt(
+            let n = self.call_rt(
                 builder,
                 "knot_relation_sum_direct",
                 &[db, rel_val, is_float],
             );
+            // sum : Rel a -> Rel a — a one-element relation.
+            return self.call_rt(builder, "knot_relation_singleton", &[n]);
         }
 
         // Implicit dictionary: prepend the record resolved during inference as
@@ -16871,12 +16906,15 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 let rt_fn = query.runtime_fn();
                 // SUM and MIN/MAX take an extra I64 flag (is_float / is_text);
                 // AVG (`knot_source_query_float`) takes none.
-                if matches!(rt_fn, "knot_source_query_sum" | "knot_source_query_value") {
+                let n = if matches!(rt_fn, "knot_source_query_sum" | "knot_source_query_value") {
                     let flag = builder.ins().iconst(types::I64, *result_flag as i64);
                     self.call_rt(builder, rt_fn, &[db, sql_ptr, sql_len, params_rel, flag])
                 } else {
                     self.call_rt(builder, rt_fn, &[db, sql_ptr, sql_len, params_rel])
-                }
+                };
+                // The scalar aggregates (sum/avg/minOn/maxOn) yield a one-element
+                // relation (Rel <scalar>), so they compose into further queries.
+                self.call_rt(builder, "knot_relation_singleton", &[n])
             }
         }
     }

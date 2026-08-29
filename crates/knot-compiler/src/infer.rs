@@ -10972,9 +10972,10 @@ impl Infer {
                     unit_binops: vec![],
                     ty: Ty::Fun(
                         Box::new(Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Bool))),
+                        // countWhere : ... -> Rel (Int u) — a one-element relation.
                         Box::new(Ty::Fun(
                             Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
-                            Box::new(int_u),
+                            Box::new(Ty::Relation(Box::new(int_u))),
                         )),
                     ),
                 },
@@ -11317,9 +11318,10 @@ impl Infer {
                     )),
                     Box::new(Ty::Fun(
                         Box::new(Ty::Var(b)),
+                        // fold : ... -> Rel b — the folded value is a one-element relation.
                         Box::new(Ty::Fun(
                             Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
-                            Box::new(Ty::Var(b)),
+                            Box::new(Ty::Relation(Box::new(Ty::Var(b)))),
                         )),
                     )),
                 ),
@@ -11482,9 +11484,10 @@ impl Infer {
                     span: Span::new(0, 0),
                 }],
                 unit_binops: vec![],
+                // sum : Rel a -> Rel a — the sum is a one-element relation.
                 ty: Ty::Fun(
                     Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
-                    Box::new(Ty::Var(a)),
+                    Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
                 ),
             },
         );
@@ -11503,9 +11506,10 @@ impl Infer {
                     unit_binops: vec![],
                     ty: Ty::Fun(
                         Box::new(Ty::Fun(Box::new(Ty::Var(a)), Box::new(float_u.clone()))),
+                        // avg : ... -> Rel (Float u) — a one-element relation.
                         Box::new(Ty::Fun(
                             Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
-                            Box::new(float_u),
+                            Box::new(Ty::Relation(Box::new(float_u))),
                         )),
                     ),
                 },
@@ -11533,9 +11537,10 @@ impl Infer {
                 unit_binops: vec![],
                 ty: Ty::Fun(
                     Box::new(Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Var(b)))),
+                    // minOn : ... -> Rel b — a one-element relation.
                     Box::new(Ty::Fun(
                         Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
-                        Box::new(Ty::Var(b)),
+                        Box::new(Ty::Relation(Box::new(Ty::Var(b)))),
                     )),
                 ),
             },
@@ -11557,9 +11562,10 @@ impl Infer {
                 unit_binops: vec![],
                 ty: Ty::Fun(
                     Box::new(Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Var(b)))),
+                    // maxOn : ... -> Rel b — a one-element relation.
                     Box::new(Ty::Fun(
                         Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
-                        Box::new(Ty::Var(b)),
+                        Box::new(Ty::Relation(Box::new(Ty::Var(b)))),
                     )),
                 ),
             },

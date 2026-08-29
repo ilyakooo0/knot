@@ -42,8 +42,8 @@ Rel C  *cs
   base.println (base.show (base.count rows))
   base.println (base.show (base.sum (base.map (\c -> c.n) rows)))
   yield {})"#,
-        // count is a one-element relation now (Rel Int), so it shows as [3].
-        "\"[3]\"\n\"6\"\n{}",
+        // count and sum are one-element relations now (Rel Int) — [3] and [6].
+        "\"[3]\"\n\"[6]\"\n{}",
     );
 }
 

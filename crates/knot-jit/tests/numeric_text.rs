@@ -123,7 +123,7 @@ fn elem_membership() {
 
 #[test]
 fn count_where() {
-    assert_show("base.countWhere (\\x -> x > 2) [1  2  3  4]", "2");
+    assert_show("base.countWhere (\\x -> x > 2) [1  2  3  4]", "[2]");  // countWhere is a one-element relation now
 }
 
 // ── Record / misc ──────────────────────────────────────────────────────────

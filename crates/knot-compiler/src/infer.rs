@@ -11812,7 +11812,8 @@ impl Infer {
             );
         }
 
-        // any : ∀a. (a -> Bool) -> [a] -> Bool
+        // any : ∀a. (a -> Bool) -> [a] -> Rel Bool  (a one-element relation,
+        // like the aggregates — a query result, not an immediate extraction).
         {
             let a = self.fresh_var();
             self.bind_top(
@@ -11823,14 +11824,14 @@ impl Infer {
                         Box::new(Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Bool))),
                         Box::new(Ty::Fun(
                             Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
-                            Box::new(Ty::Bool),
+                            Box::new(Ty::Relation(Box::new(Ty::Bool))),
                         )),
                     ),
                 ),
             );
         }
 
-        // all : ∀a. (a -> Bool) -> [a] -> Bool
+        // all : ∀a. (a -> Bool) -> [a] -> Rel Bool  (one-element relation, like any)
         {
             let a = self.fresh_var();
             self.bind_top(
@@ -11841,7 +11842,7 @@ impl Infer {
                         Box::new(Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Bool))),
                         Box::new(Ty::Fun(
                             Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
-                            Box::new(Ty::Bool),
+                            Box::new(Ty::Relation(Box::new(Ty::Bool))),
                         )),
                     ),
                 ),
@@ -11931,7 +11932,7 @@ impl Infer {
             )),
         );
 
-        // elem : ∀a. a -> [a] -> Bool
+        // elem : ∀a. a -> [a] -> Rel Bool  (one-element relation, like any/all)
         let a = self.fresh_var();
         self.bind_top(
             "elem",
@@ -11941,7 +11942,7 @@ impl Infer {
                     Box::new(Ty::Var(a)),
                     Box::new(Ty::Fun(
                         Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
-                        Box::new(Ty::Bool),
+                        Box::new(Ty::Relation(Box::new(Ty::Bool))),
                     )),
                 ),
             ),

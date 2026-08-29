@@ -3439,7 +3439,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
         self.define_stdlib_fn_2("contains", "knot_text_contains", false);
         self.define_stdlib_fn_2("startsWith", "knot_text_starts_with", false);
         self.define_stdlib_fn_2("endsWith", "knot_text_ends_with", false);
-        self.define_stdlib_fn_2("elem", "knot_list_elem", false);
+        self.define_stdlib_fn_2_rel("elem", "knot_list_elem", false);
         self.define_stdlib_fn_2("diff", "knot_relation_diff", true);
         self.define_stdlib_fn_2("inter", "knot_relation_inter", true);
         self.define_stdlib_sum();
@@ -3454,8 +3454,8 @@ impl<M: cranelift_module::Module> Codegen<M> {
         self.define_stdlib_fn_2_rel("minOn", "knot_relation_min", true);
         self.define_stdlib_fn_2_rel("maxOn", "knot_relation_max", true);
         self.define_stdlib_fn_2_rel("countWhere", "knot_relation_count_where", true);
-        self.define_stdlib_fn_2("any", "knot_relation_any", true);
-        self.define_stdlib_fn_2("all", "knot_relation_all", true);
+        self.define_stdlib_fn_2_rel("any", "knot_relation_any", true);
+        self.define_stdlib_fn_2_rel("all", "knot_relation_all", true);
 
         // List ADT builtins (`base.list.*`). Order-preserving sequence ops,
         // runtime-implemented (knot_list_*). Higher-order ones (map/filter/
@@ -16489,11 +16489,15 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 // count : Rel a -> Rel Int — a one-element relation.
                 self.call_rt(builder, "knot_relation_singleton", &[n])
             }
-            QueryTerminal::Exists { .. } => self.call_rt(
-                builder,
-                "knot_source_query_exists",
-                &[db, sql_ptr, sql_len, params_rel],
-            ),
+            QueryTerminal::Exists { .. } => {
+                let b = self.call_rt(
+                    builder,
+                    "knot_source_query_exists",
+                    &[db, sql_ptr, sql_len, params_rel],
+                );
+                // any/all/elem : ... -> Rel Bool — a one-element relation.
+                self.call_rt(builder, "knot_relation_singleton", &[b])
+            }
             QueryTerminal::Aggregate { result_flag, .. } => {
                 let rt_fn = query.runtime_fn();
                 // SUM and MIN/MAX take an extra I64 flag (is_float / is_text);

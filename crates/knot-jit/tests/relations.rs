@@ -154,19 +154,21 @@ fn diff_relations() {
 
 #[test]
 fn elem_present() {
-    assert_show("base.elem 2 [1  2  3]", "True");
+    // elem is a one-element relation now (Rel Bool).
+    assert_show("base.elem 2 [1  2  3]", "[True]");
 }
 
 #[test]
 fn elem_absent() {
-    assert_show("base.elem 9 [1  2  3]", "False");
+    assert_show("base.elem 9 [1  2  3]", "[False]");
 }
 
 #[test]
 fn any_all() {
-    assert_show("base.any (\\n -> n > 2) [1  2  3]", "True");
-    assert_show("base.all (\\n -> n > 0) [1  2  3]", "True");
-    assert_show("base.all (\\n -> n > 1) [1  2  3]", "False");
+    // any/all are one-element relations now (Rel Bool).
+    assert_show("base.any (\\n -> n > 2) [1  2  3]", "[True]");
+    assert_show("base.all (\\n -> n > 0) [1  2  3]", "[True]");
+    assert_show("base.all (\\n -> n > 1) [1  2  3]", "[False]");
 }
 
 // ── ordering / slicing (sorted relations have a fixed iteration order) ───

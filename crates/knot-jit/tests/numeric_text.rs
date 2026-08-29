@@ -110,8 +110,9 @@ fn upsert_by_replaces_or_appends() {
 
 #[test]
 fn elem_membership() {
-    assert_show("base.elem 2 [1  2  3]", "True");
-    assert_show("base.elem 9 [1  2  3]", "False");
+    // elem is a one-element relation now (Rel Bool), so it shows as [True].
+    assert_show("base.elem 2 [1  2  3]", "[True]");
+    assert_show("base.elem 9 [1  2  3]", "[False]");
 }
 
 #[test]

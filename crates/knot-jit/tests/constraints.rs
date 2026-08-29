@@ -18,7 +18,8 @@ Rel {customer Text  amount (Int 1)}  *orders
   full *orders = [{customer "Alice"  amount 100}]
   base.println (base.show (base.count *orders))
   yield {})"#,
-        "\"1\"\n{}",
+        // count is a one-element relation now (Rel Int), so it shows as [1].
+        "\"[1]\"\n{}",
     );
 }
 

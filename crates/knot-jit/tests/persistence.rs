@@ -22,9 +22,9 @@ Rel Todo  *todos
     yield {owner t.owner  count (base.count t)})
   base.println (base.show groups)
   yield {})"#,
-        // Set semantics: identical rows are deduped on write (INSERT OR
-        // IGNORE), so distinct open rows only. owners x and y each have 1.
-        "\"[{count 1  owner x}, {count 1  owner y}]\"\n{}",
+        // count is a one-element relation now (Rel Int), so the count field
+        // holds `[1]` (a relation), not the bare number.
+        "\"[{count [1]  owner x}, {count [1]  owner y}]\"\n{}",
     );
 }
 
@@ -42,7 +42,8 @@ Rel C  *cs
   base.println (base.show (base.count rows))
   base.println (base.show (base.sum (base.map (\c -> c.n) rows)))
   yield {})"#,
-        "\"3\"\n\"6\"\n{}",
+        // count is a one-element relation now (Rel Int), so it shows as [3].
+        "\"[3]\"\n\"6\"\n{}",
     );
 }
 

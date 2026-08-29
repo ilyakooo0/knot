@@ -88,6 +88,7 @@ Rel C  *cs
   base.println (base.show (base.count rows))
   base.println "survived"
   yield {})"#,
-        &["\"1\"", "\"survived\"", "{}"],
+        // count is a one-element relation now (Rel Int), so it shows as [1].
+        &["\"[1]\"", "\"survived\"", "{}"],
     );
 }

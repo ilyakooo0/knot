@@ -4910,10 +4910,12 @@ impl Infer {
             }
             Ty::Relation(inner) => {
                 // `Rel T`; parenthesize a compound element type so `Rel` binds
-                // tighter than `->` / application (`Rel (a -> b)`).
+                // tighter than `->` / application (`Rel (a -> b)`), and a
+                // unit-bearing scalar (`Int 1`) so `Rel Int 1` re-parses.
                 let inner_s = self.display_ty(inner);
                 match inner.peel_alias() {
                     Ty::Fun(..) | Ty::App(..) | Ty::Relation(_) => format!("Rel ({inner_s})"),
+                    Ty::Con(_, args) if !args.is_empty() => format!("Rel ({inner_s})"),
                     _ => format!("Rel {inner_s}"),
                 }
             }
@@ -10888,9 +10890,10 @@ impl Infer {
             ),
         );
 
-        // count : ∀a u. [a] -> IO (Int u)
-        // Reading a relation is a DB effect — count forces the query, so the
-        // result is IO. The in-memory Vec overload (`vecCount`) stays pure.
+        // count : ∀a u. [a] -> [Int u]
+        // count is a query combinator, not a runner: it composes into the SQL
+        // (SELECT COUNT(*)) and yields a one-element relation of the count, so
+        // it can feed other queries. Extract the number with run.
         {
             let a = self.fresh_var();
             let u = self.fresh_unit_var();
@@ -10904,7 +10907,7 @@ impl Infer {
                     unit_binops: vec![],
                     ty: Ty::Fun(
                         Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
-                        Box::new(Ty::IO(Box::new(int_u))),
+                        Box::new(Ty::Relation(Box::new(int_u))),
                     ),
                 },
             );
@@ -13609,10 +13612,22 @@ fn display_ty_clean_inner(
             }
             format!("{{{}}}", parts.join("  "))
         }
-        Ty::Relation(inner) => format!(
-            "Rel {}",
-            display_ty_clean_inner(inner, names, unit_names, true, wire)
-        ),
+        Ty::Relation(inner) => {
+            // Parenthesize a compound or unit-bearing element so the result
+            // re-parses: `Rel (Int 1)`, not `Rel Int 1` (which reads as `Rel Int`
+            // applied to `1`).
+            let inner_s = display_ty_clean_inner(inner, names, unit_names, true, wire);
+            let needs_parens = match inner.peel_alias() {
+                Ty::Fun(..) | Ty::App(..) | Ty::Relation(_) => true,
+                Ty::Con(_, args) => !args.is_empty(),
+                _ => false,
+            };
+            if needs_parens {
+                format!("Rel ({inner_s})")
+            } else {
+                format!("Rel {inner_s}")
+            }
+        }
         Ty::Con(name, args) => {
             // Unit-bearing Int/Float → `Int u`/`Float u`, collapsing to
             // `Int`/`Float` when dimensionless. On the compile-expected WIRE

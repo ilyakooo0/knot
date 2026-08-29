@@ -119,6 +119,7 @@ Rel {name Text  age Nat}  *people
   full *people = [{name "a"  age 30}]
   base.println (base.show (base.count *people))
   yield {})"#,
-        "\"1\"\n{}",
+        // count is a one-element relation now (Rel Int), so it shows as [1].
+        "\"[1]\"\n{}",
     );
 }

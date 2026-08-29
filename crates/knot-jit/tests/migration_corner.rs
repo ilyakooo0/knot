@@ -431,7 +431,7 @@ Rel EvV2  *evs
   base.println (base.show (base.count rows))
   yield {})"#;
     let out = lifecycle(&dir, "mig_adt_source", v1, v2, committed);
-    assert_eq!(out, "\"2\"\n{}");
+    assert_eq!(out, "\"[2]\"\n{}");
 }
 
 // ── Data volume ──────────────────────────────────────────────────────────────
@@ -464,7 +464,7 @@ Rel V2  *r
   base.println (base.show (base.count rows))
   yield {})"#;
     let out = lifecycle(&dir, "mig_empty", v1, v2, committed);
-    assert_eq!(out, "\"0\"\n{}");
+    assert_eq!(out, "\"[0]\"\n{}");
 }
 
 /// Several rows all survive; the transform applies to each.
@@ -496,7 +496,7 @@ Rel V2  *people
   base.println (base.show (base.count rows))
   yield {})"#;
     let out = lifecycle(&dir, "mig_multi", v1, v2, committed);
-    assert_eq!(out, "\"4\"\n{}");
+    assert_eq!(out, "\"[4]\"\n{}");
 }
 
 // ── Chains ───────────────────────────────────────────────────────────────────

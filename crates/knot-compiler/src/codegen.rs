@@ -2218,7 +2218,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
         self.build_function(func_id, sig, |cg, builder, entry| {
             let rel = builder.block_params(entry)[1];
             let len = cg.call_rt(builder, "knot_relation_len", &[rel]);
-            let result = cg.call_rt(builder, "knot_value_int", &[len]);
+            let n = cg.call_rt(builder, "knot_value_int", &[len]);
+            // count : Rel a -> Rel Int — a one-element relation.
+            let result = cg.call_rt(builder, "knot_relation_singleton", &[n]);
             builder.ins().return_(&[result]);
         });
     }
@@ -7382,7 +7384,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 if self.source_schemas.contains_key(&source_name) {
                     self.emit_stm_track_read(builder, &source_name);
                     let (name_ptr, name_len) = self.string_ptr(builder, &source_name);
-                    return self.call_rt(builder, "knot_source_count", &[db, name_ptr, name_len]);
+                    let n = self.call_rt(builder, "knot_source_count", &[db, name_ptr, name_len]);
+                    // count : Rel a -> Rel Int — the count is a one-element
+                    // relation, composable into further queries.
+                    return self.call_rt(builder, "knot_relation_singleton", &[n]);
                 }
             }
 
@@ -7459,11 +7464,12 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 );
                 let params_rel = self.compile_sql_params(builder, &[n_param], env, db);
                 let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
-                return self.call_rt(
+                let n = self.call_rt(
                     builder,
                     "knot_source_query_count",
                     &[db, sql_ptr, sql_len, params_rel],
                 );
+                return self.call_rt(builder, "knot_relation_singleton", &[n]);
             }
 
             // count (map (\r -> r.<field>) *source) → SELECT COUNT(*) —
@@ -7476,7 +7482,8 @@ impl<M: cranelift_module::Module> Codegen<M> {
             {
                 self.emit_stm_track_read(builder, &source_name);
                 let (name_ptr, name_len) = self.string_ptr(builder, &source_name);
-                return self.call_rt(builder, "knot_source_count", &[db, name_ptr, name_len]);
+                let n = self.call_rt(builder, "knot_source_count", &[db, name_ptr, name_len]);
+                return self.call_rt(builder, "knot_relation_singleton", &[n]);
             }
 
             // count (*source |> ops) → delegate to the pipe-chain
@@ -16846,11 +16853,15 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     &[db, sql_ptr, sql_len, schema_ptr, schema_len, params_rel],
                 )
             }
-            QueryTerminal::Count => self.call_rt(
-                builder,
-                "knot_source_query_count",
-                &[db, sql_ptr, sql_len, params_rel],
-            ),
+            QueryTerminal::Count => {
+                let n = self.call_rt(
+                    builder,
+                    "knot_source_query_count",
+                    &[db, sql_ptr, sql_len, params_rel],
+                );
+                // count : Rel a -> Rel Int — a one-element relation.
+                self.call_rt(builder, "knot_relation_singleton", &[n])
+            }
             QueryTerminal::Exists { .. } => self.call_rt(
                 builder,
                 "knot_source_query_exists",

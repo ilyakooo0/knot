@@ -17,7 +17,8 @@ fn nil_and_cons() {
 #[test]
 fn list_literal_container_polymorphism() {
     // Default: a list literal is a relation (a set — `[1 1 2]` holds 2 rows).
-    assert_show("base.count [1  1  2]", "2");
+    // count is a one-element relation now (Rel Int), so it shows as [2].
+    assert_show("base.count [1  1  2]", "[2]");
     // `Vec` context: ordered, no dedup.
     assert_show("base.vec.count [1  1  2]", "3");
     // `List` context (via `the`): builds a Cons/Nil chain.

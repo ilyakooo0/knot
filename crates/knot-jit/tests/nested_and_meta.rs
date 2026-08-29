@@ -16,9 +16,10 @@ fn nested_relation_construction() {
 
 #[test]
 fn nested_relation_count() {
+    // count is a one-element relation now (Rel Int), so it shows as [2].
     assert_show(
         "base.count {team \"eng\"  members [{name \"a\"}  {name \"b\"}]}.members",
-        "2",
+        "[2]",
     );
 }
 

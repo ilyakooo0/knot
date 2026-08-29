@@ -14969,6 +14969,55 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     } else {
                         return None;
                     };
+                    // An in-memory relation literal (`[{name "x"}, ...]`) becomes
+                    // a FROM subquery (`SELECT ... UNION ALL ...`) cross-joined
+                    // with the source — no materialization. Falls back to
+                    // in-memory if the rows aren't all literal records.
+                    if let ast::ExprKind::List(_) = &expr.node {
+                        let sub = relation_literal_to_sql(expr)?;
+                        let ast::ExprKind::List(rows) = &expr.node else {
+                            return None;
+                        };
+                        // Scalar rows → a single `_value` column; record rows →
+                        // the record's field schema. Both are the source-schema
+                        // descriptor form.
+                        let schema = match &rows[0].node {
+                            ast::ExprKind::Lit(ast::Literal::Int(_)) => "{_value Int 1}".to_string(),
+                            ast::ExprKind::Lit(ast::Literal::Float(_)) => {
+                                "{_value Float 1}".to_string()
+                            }
+                            ast::ExprKind::Lit(ast::Literal::Text(_)) => "{_value Text}".to_string(),
+                            ast::ExprKind::Record(first_fields) => format!(
+                                "{{{}}}",
+                                first_fields
+                                    .iter()
+                                    .map(|f| {
+                                        let n = f.name.as_name()?;
+                                        let ty = match &f.value.node {
+                                            ast::ExprKind::Lit(ast::Literal::Int(_)) => Some("Int 1"),
+                                            ast::ExprKind::Lit(ast::Literal::Float(_)) => {
+                                                Some("Float 1")
+                                            }
+                                            ast::ExprKind::Lit(ast::Literal::Text(_)) => Some("Text"),
+                                            _ => None,
+                                        }?;
+                                        Some(format!("{n} {ty}"))
+                                    })
+                                    .collect::<Option<Vec<_>>>()?
+                                    .join("  ")
+                            ),
+                            _ => return None,
+                        };
+                        let alias = format!("t{}", tables.len());
+                        bind_to_alias.insert(var_name.clone(), alias.clone());
+                        bind_to_schema.insert(var_name.clone(), schema);
+                        tables.push(SqlTable {
+                            source_name: String::new(),
+                            alias,
+                            subquery: Some((sub, Vec::new())),
+                        });
+                        continue;
+                    }
                     let source_name = if let ast::ExprKind::SourceRef { name, .. } = &expr.node {
                         name.clone()
                     } else if let ast::ExprKind::Var(var_name) = &expr.node {
@@ -19345,6 +19394,86 @@ fn expr_to_sql_param(expr: &ast::Expr) -> Option<SqlParamSource> {
     }
 }
 
+/// Render a single literal as inline SQL text (for a literal-relation table's
+/// `SELECT`/`UNION ALL` rows). Strings are single-quoted with `''` escaping.
+fn lit_to_sql(lit: &ast::Literal) -> String {
+    match lit {
+        ast::Literal::Int(s) => s.clone(),
+        ast::Literal::Float(f) => format!("{f}"),
+        ast::Literal::Text(s) => format!("'{}'", s.replace('\'', "''")),
+    }
+}
+
+/// Render an in-memory relation literal (`[row1, row2, ...]`) as a FROM-item
+/// subquery whose columns match the record fields, so a comprehension that mixes
+/// a source and a literal cross-joins in SQL instead of materializing. Each row
+/// must be a record literal with the same fields (positionally). Returns
+/// `SELECT <lit> AS <col>, ... UNION ALL SELECT <lit>, ... ...`. Returns None if
+/// any row isn't a record of literals (falls back to in-memory).
+fn relation_literal_to_sql(expr: &ast::Expr) -> Option<String> {
+    let ast::ExprKind::List(rows) = &expr.node else {
+        return None;
+    };
+    if rows.is_empty() {
+        return None;
+    }
+    // Scalar rows (`[100  200]`): a single `_value` column, matching the
+    // scalar-source schema form.
+    if matches!(&rows[0].node, ast::ExprKind::Lit(_)) {
+        let mut parts = Vec::new();
+        for (i, row) in rows.iter().enumerate() {
+            let ast::ExprKind::Lit(lit) = &row.node else {
+                return None;
+            };
+            let v = lit_to_sql(lit);
+            if i == 0 {
+                parts.push(format!("SELECT {v} AS \"_value\""));
+            } else {
+                parts.push(format!("SELECT {v}"));
+            }
+        }
+        return Some(parts.join(" UNION ALL "));
+    }
+    // Column names from the first row's record fields.
+    let ast::ExprKind::Record(first_fields) = &rows[0].node else {
+        return None;
+    };
+    let col_names: Vec<String> = first_fields
+        .iter()
+        .map(|f| f.name.as_name().map(|n| n.to_string()))
+        .collect::<Option<Vec<_>>>()?;
+    // Each row: the literal values in field order (must match the first row's
+    // field names positionally).
+    let mut parts = Vec::new();
+    for (row_idx, row) in rows.iter().enumerate() {
+        let ast::ExprKind::Record(rf) = &row.node else {
+            return None;
+        };
+        if rf.len() != col_names.len() {
+            return None;
+        }
+        let mut cells = Vec::new();
+        for (i, f) in rf.iter().enumerate() {
+            let fname = f.name.as_name()?;
+            if fname != col_names[i].as_str() {
+                return None; // field names/order differ across rows — bail
+            }
+            let ast::ExprKind::Lit(lit) = &f.value.node else {
+                return None;
+            };
+            let v = lit_to_sql(lit);
+            // Only the first SELECT carries the column aliases.
+            if row_idx == 0 {
+                cells.push(format!("{v} AS {}", quote_sql_ident(&col_names[i])));
+            } else {
+                cells.push(v);
+            }
+        }
+        parts.push(format!("SELECT {}", cells.join(", ")));
+    }
+    Some(parts.join(" UNION ALL "))
+}
+
 /// Extract a SQL column reference from a lambda body like `\x -> x.price`.
 /// Returns the SQL fragment e.g. `t0."price"` (or just `"price"` if alias is empty).
 /// Peel a curried application into (head, args): `f a b` → (f, [a, b]).
@@ -19755,6 +19884,16 @@ fn try_multi_table_arithmetic_expr(
             ast::Literal::Float(f) => Some(f.to_string()),
             ast::Literal::Text(s) => Some(format!("'{}'", s.replace('\'', "''"))),
         },
+        // A bare scalar bind var (`x` from `x <- [100 200]`, a single-column
+        // `_value` table) resolves to its `_value` column.
+        ast::ExprKind::Var(name) => {
+            let alias = bind_to_alias.get(name.as_str())?;
+            let schema = bind_to_schema.get(name.as_str())?;
+            if lookup_col_type_from_schema(schema, "_value").is_some() {
+                return Some(format!("{}.{}", alias, quote_sql_ident("_value")));
+            }
+            None
+        }
         ast::ExprKind::BinOp { op, lhs, rhs } => {
             let sql_op = match op {
                 ast::BinOp::Add => "+",

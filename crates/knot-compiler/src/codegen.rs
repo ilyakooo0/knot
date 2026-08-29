@@ -15385,8 +15385,8 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         ast::BinOp::Div | ast::BinOp::Mod => return None,
                         _ => unreachable!(),
                     };
-                    let l = Self::try_compile_sql_atom(bind_aliases, lhs, env, let_binds)?;
-                    let r = Self::try_compile_sql_atom(bind_aliases, rhs, env, let_binds)?;
+                    let l = Self::try_compile_sql_atom(bind_aliases, bind_schemas, lhs, env, let_binds)?;
+                    let r = Self::try_compile_sql_atom(bind_aliases, bind_schemas, rhs, env, let_binds)?;
                     let mut params = l.params;
                     params.extend(r.params);
                     Some(SqlFragment {
@@ -15439,8 +15439,8 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 {
                     // contains needle haystack → INSTR(haystack, needle) > 0
                     let needle =
-                        Self::try_compile_sql_atom(bind_aliases, first_arg, env, let_binds)?;
-                    let haystack = Self::try_compile_sql_atom(bind_aliases, arg, env, let_binds)?;
+                        Self::try_compile_sql_atom(bind_aliases, bind_schemas, first_arg, env, let_binds)?;
+                    let haystack = Self::try_compile_sql_atom(bind_aliases, bind_schemas, arg, env, let_binds)?;
                     let mut params = haystack.params;
                     params.extend(needle.params);
                     return Some(SqlFragment {
@@ -15459,6 +15459,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
     /// `let_binds` maps let-bound variable names to their original expressions.
     fn try_compile_sql_atom(
         bind_aliases: &HashMap<String, String>,
+        bind_schemas: &HashMap<String, String>,
         expr: &ast::Expr,
         env: &Env,
         let_binds: &HashMap<String, ast::Expr>,
@@ -15489,7 +15490,17 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 params: vec![SqlParamSource::Literal(lit.clone(), expr.span)],
             }),
             ast::ExprKind::Var(name) => {
-                if bind_aliases.contains_key(name.as_str()) {
+                if let Some(alias) = bind_aliases.get(name.as_str()) {
+                    // A scalar literal bind var (`x <- [100 200]`): resolve to its
+                    // single `_value` column so it can appear in WHERE/projection.
+                    if let Some(schema) = bind_schemas.get(name.as_str())
+                        && lookup_col_type_from_schema(schema, "_value").is_some()
+                    {
+                        return Some(SqlFragment {
+                            sql: format!("{}.{}", alias, quote_sql_ident("_value")),
+                            params: vec![],
+                        });
+                    }
                     None
                 } else if let Some(let_expr) = let_binds.get(name.as_str()) {
                     // Let-bound variable from within the do-block — compile
@@ -15527,8 +15538,8 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     ast::BinOp::Concat => "||",
                     _ => return None,
                 };
-                let l = Self::try_compile_sql_atom(bind_aliases, lhs, env, let_binds)?;
-                let r = Self::try_compile_sql_atom(bind_aliases, rhs, env, let_binds)?;
+                let l = Self::try_compile_sql_atom(bind_aliases, bind_schemas, lhs, env, let_binds)?;
+                let r = Self::try_compile_sql_atom(bind_aliases, bind_schemas, rhs, env, let_binds)?;
                 let mut params = l.params;
                 params.extend(r.params);
                 Some(SqlFragment {
@@ -15585,8 +15596,8 @@ impl<M: cranelift_module::Module> Codegen<M> {
         {
             return None;
         }
-        let l = Self::try_compile_sql_atom(bind_aliases, lhs, env, let_binds)?;
-        let r = Self::try_compile_sql_atom(bind_aliases, rhs, env, let_binds)?;
+        let l = Self::try_compile_sql_atom(bind_aliases, bind_schemas, lhs, env, let_binds)?;
+        let r = Self::try_compile_sql_atom(bind_aliases, bind_schemas, rhs, env, let_binds)?;
         // Int columns, Int params, and Int arithmetic results are all native
         // SQLite INTEGERs, so a comparison needs no cast — INTEGER-to-INTEGER
         // (or REAL after an i64-overflow promotion) compares numerically.
@@ -19949,6 +19960,11 @@ fn infer_multi_table_sql_expr_type(
             ast::Literal::Float(_) => Some("float".to_string()),
             ast::Literal::Text(_) => Some("text".to_string()),
         },
+        // A bare scalar literal bind var (`x <- [100 200]`) — its `_value` type.
+        ast::ExprKind::Var(name) => {
+            let schema = bind_to_schema.get(name.as_str())?;
+            lookup_col_type_from_schema(schema, "_value")
+        }
         ast::ExprKind::BinOp { op, lhs, rhs } => {
             match op {
                 ast::BinOp::Concat => Some("text".to_string()),

@@ -60,3 +60,39 @@ fn mixed_comprehension_correct_rows() {
     assert!(stdout.contains("{n 130  name a}") && stdout.contains("{n 230  name a}"),
         "expected the cross product, got:\n{stdout}");
 }
+
+#[test]
+fn where_over_literal_column_pushes_down() {
+    // A `where` referencing a literal table's `_value` column must translate to
+    // a SQL WHERE (not materialize).
+    let stderr = build_stderr(
+        "wlc",
+        "with {\nPerson  {name Text  age (Int 1)}\nRel Person  *people\nfiltered  (|\n  p <- *people\n  x <- [100  200]\n  where x > 150\n  yield {name p.name  n (p.age + x)})\n}\n(| full *people = [{name \"a\"  age 30}]; base.println (base.show filtered); yield {})\n",
+    );
+    assert!(
+        !stderr.contains("in-memory table read"),
+        "a where over the literal column should push down; got:\n{stderr}"
+    );
+    let (stdout, _, code) = e2e::run_program(
+        "wlc",
+        "with {\nPerson  {name Text  age (Int 1)}\nRel Person  *people\nfiltered  (|\n  p <- *people\n  x <- [100  200]\n  where x > 150\n  yield {name p.name  n (p.age + x)})\n}\n(| full *people = [{name \"a\"  age 30}]; base.println (base.show filtered); yield {})\n",
+    );
+    assert_eq!(code, 0);
+    // Only x=200 survives (200 > 150), so n = 30 + 200 = 230.
+    assert!(stdout.contains("{n 230  name a}") && !stdout.contains("{n 130"),
+        "expected only the x=200 row, got:\n{stdout}");
+}
+
+#[test]
+fn literal_column_arithmetic_stays_int() {
+    // `p.age + x` where x is a literal Int: the projection column must be typed
+    // Int (not the float fallback), so the result renders as integers.
+    let (stdout, _, code) = e2e::run_program(
+        "lci",
+        "with {\nPerson  {name Text  age (Int 1)}\nRel Person  *people\npairs  (|\n  p <- *people\n  x <- [100  200]\n  yield {name p.name  n (p.age + x)})\n}\n(| full *people = [{name \"a\"  age 30}]; base.println (base.show (base.map (\\r -> r.n) pairs)); yield {})\n",
+    );
+    assert_eq!(code, 0);
+    // Integers, not floats (a float mistype would render 130.0 / 230.0).
+    assert!(stdout.contains("[130, 230]") && !stdout.contains("130.0"),
+        "expected integer arithmetic, got:\n{stdout}");
+}

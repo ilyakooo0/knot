@@ -96,3 +96,38 @@ fn literal_column_arithmetic_stays_int() {
     assert!(stdout.contains("[130, 230]") && !stdout.contains("130.0"),
         "expected integer arithmetic, got:\n{stdout}");
 }
+
+#[test]
+fn union_source_and_literal_pushes_down() {
+    // `base.union *people [literal]`: the source stays a table reference, the
+    // literal is an inline subquery — a single UNION query, no materialization.
+    let stderr = build_stderr(
+        "usl",
+        "with {\nPerson  {name Text  age (Int 1)}\nRel Person  *people\n}\n(| full *people = [{name \"a\"  age 30}]; base.println (base.show (base.union *people [{name \"c\"  age 50}])); yield {})\n",
+    );
+    assert!(
+        !stderr.contains("in-memory table read"),
+        "the source side of a union should NOT be read into memory; got:\n{stderr}"
+    );
+    let (stdout, _, code) = e2e::run_program(
+        "usl",
+        "with {\nPerson  {name Text  age (Int 1)}\nRel Person  *people\n}\n(| full *people = [{name \"a\"  age 30}]; base.println (base.show (base.union *people [{name \"c\"  age 50}])); yield {})\n",
+    );
+    assert_eq!(code, 0);
+    assert!(stdout.contains("{age 30  name a}") && stdout.contains("{age 50  name c}"),
+        "expected the union of both, got:\n{stdout}");
+}
+
+#[test]
+fn inter_source_and_literal_pushes_down() {
+    // `base.inter` over a source and a multi-row literal: INTERSECT, both sides
+    // in SQL.
+    let (stdout, _, code) = e2e::run_program(
+        "isl",
+        "with {\nPerson  {name Text  age (Int 1)}\nRel Person  *people\n}\n(| full *people = [{name \"a\"  age 30}  {name \"b\"  age 10}]; base.println (base.show (base.inter *people [{name \"a\"  age 30}  {name \"c\"  age 50}])); yield {})\n",
+    );
+    assert_eq!(code, 0);
+    // Only {a 30} is in both.
+    assert!(stdout.contains("{age 30  name a}") && !stdout.contains("name b") && !stdout.contains("name c"),
+        "expected only the shared row, got:\n{stdout}");
+}

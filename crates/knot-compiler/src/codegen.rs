@@ -8740,10 +8740,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
         }
 
         // SQL set operations: diff/inter/union on two source relations
-        if let ast::ExprKind::Var(name) = &func_expr.node
-            && !user_shadows_special
+        if !user_shadows_special
+            && let Some(name) = Self::query_form_name(func_expr)
         {
-            let sql_op = match name.as_str() {
+            let sql_op = match name {
                 "diff" => Some("EXCEPT"),
                 "inter" => Some("INTERSECT"),
                 "union" => Some("UNION"),
@@ -14771,6 +14771,21 @@ impl<M: cranelift_module::Module> Codegen<M> {
             });
         }
 
+        // Case 4: an in-memory relation literal (`[{name "c"  age 50}]` or
+        // `[1 2 3]`) → an inline table subquery (`SELECT ... AS col UNION ALL
+        // ...`), so a set op mixing a source and a literal stays in SQL.
+        if let ast::ExprKind::List(_) = &expr.node
+            && let Some(sub) = relation_literal_to_sql(expr)
+            && let Some(schema) = relation_literal_schema(expr)
+        {
+            return Some(SetOpSubquery {
+                sql: sub,
+                schema,
+                params: vec![],
+                tables: vec![],
+            });
+        }
+
         None
     }
 
@@ -14975,39 +14990,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     // in-memory if the rows aren't all literal records.
                     if let ast::ExprKind::List(_) = &expr.node {
                         let sub = relation_literal_to_sql(expr)?;
-                        let ast::ExprKind::List(rows) = &expr.node else {
-                            return None;
-                        };
                         // Scalar rows → a single `_value` column; record rows →
                         // the record's field schema. Both are the source-schema
                         // descriptor form.
-                        let schema = match &rows[0].node {
-                            ast::ExprKind::Lit(ast::Literal::Int(_)) => "{_value Int 1}".to_string(),
-                            ast::ExprKind::Lit(ast::Literal::Float(_)) => {
-                                "{_value Float 1}".to_string()
-                            }
-                            ast::ExprKind::Lit(ast::Literal::Text(_)) => "{_value Text}".to_string(),
-                            ast::ExprKind::Record(first_fields) => format!(
-                                "{{{}}}",
-                                first_fields
-                                    .iter()
-                                    .map(|f| {
-                                        let n = f.name.as_name()?;
-                                        let ty = match &f.value.node {
-                                            ast::ExprKind::Lit(ast::Literal::Int(_)) => Some("Int 1"),
-                                            ast::ExprKind::Lit(ast::Literal::Float(_)) => {
-                                                Some("Float 1")
-                                            }
-                                            ast::ExprKind::Lit(ast::Literal::Text(_)) => Some("Text"),
-                                            _ => None,
-                                        }?;
-                                        Some(format!("{n} {ty}"))
-                                    })
-                                    .collect::<Option<Vec<_>>>()?
-                                    .join("  ")
-                            ),
-                            _ => return None,
-                        };
+                        let schema = relation_literal_schema(expr)?;
                         let alias = format!("t{}", tables.len());
                         bind_to_alias.insert(var_name.clone(), alias.clone());
                         bind_to_schema.insert(var_name.clone(), schema);
@@ -19483,6 +19469,40 @@ fn relation_literal_to_sql(expr: &ast::Expr) -> Option<String> {
         parts.push(format!("SELECT {}", cells.join(", ")));
     }
     Some(parts.join(" UNION ALL "))
+}
+
+/// The schema descriptor for an in-memory relation literal — `{_value Int 1}`
+/// for scalar rows, `{name Text  age (Int 1)}` for record rows. Matches the
+/// source-schema form so downstream column lookups resolve. Returns None for an
+/// empty list or a non-literal row.
+fn relation_literal_schema(expr: &ast::Expr) -> Option<String> {
+    let ast::ExprKind::List(rows) = &expr.node else {
+        return None;
+    };
+    let first = rows.first()?;
+    match &first.node {
+        ast::ExprKind::Lit(ast::Literal::Int(_)) => Some("{_value Int 1}".to_string()),
+        ast::ExprKind::Lit(ast::Literal::Float(_)) => Some("{_value Float 1}".to_string()),
+        ast::ExprKind::Lit(ast::Literal::Text(_)) => Some("{_value Text}".to_string()),
+        ast::ExprKind::Record(fields) => {
+            let inner = fields
+                .iter()
+                .map(|f| {
+                    let n = f.name.as_name()?;
+                    let ty = match &f.value.node {
+                        ast::ExprKind::Lit(ast::Literal::Int(_)) => Some("Int 1"),
+                        ast::ExprKind::Lit(ast::Literal::Float(_)) => Some("Float 1"),
+                        ast::ExprKind::Lit(ast::Literal::Text(_)) => Some("Text"),
+                        _ => None,
+                    }?;
+                    Some(format!("{n} {ty}"))
+                })
+                .collect::<Option<Vec<_>>>()?
+                .join("  ");
+            Some(format!("{{{inner}}}"))
+        }
+        _ => None,
+    }
 }
 
 /// Extract a SQL column reference from a lambda body like `\x -> x.price`.

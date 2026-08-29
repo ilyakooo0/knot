@@ -1972,6 +1972,11 @@ impl Parser {
                 }
                 let field_result = if matches!(self.peek(), TokenKind::Upper(_)) {
                     self.expect_upper("expected field name after '.'")
+                } else if self.at(&TokenKind::Not) {
+                    // `not` is a prefix-operator keyword, but as a field name
+                    // (`base.not`) it refers to the `not : Bool -> Bool` function.
+                    let tok = self.advance();
+                    Ok(("not".to_string(), tok.span))
                 } else {
                     self.expect_lower("expected field name after '.'")
                 };

@@ -1100,7 +1100,7 @@ fn compile_inner<M: cranelift_module::Module>(
         entries.sort_by_key(|(n, _)| (*n).clone());
         let names = entries
             .iter()
-            .map(|(n, _)| format!("`{n}`"))
+            .map(|(n, _)| format!("`*{n}`"))
             .collect::<Vec<_>>()
             .join(", ");
         let mut diag = knot::diagnostic::Diagnostic::info(format!(
@@ -1109,7 +1109,7 @@ fn compile_inner<M: cranelift_module::Module>(
             if entries.len() == 1 { "" } else { "s" },
         ));
         for (name, span) in &entries {
-            diag = diag.label(**span, format!("`{name}` is read in full here"));
+            diag = diag.label(**span, format!("`*{name}` is read in full here"));
         }
         diag = diag
             .note("to read only part of it, filter or narrow the query (a `where` clause, `base.take`) so only the matching rows are loaded")

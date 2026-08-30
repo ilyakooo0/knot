@@ -7191,8 +7191,13 @@ impl<M: cranelift_module::Module> Codegen<M> {
             && let Some(schema) = self.source_schemas.get(&source_name).cloned()
         {
             let fn_name = Self::query_form_name(func_expr).unwrap();
-            self.in_memory_source_reads
-                .insert(source_name.clone(), (expr.span, fn_name.to_string()));
+            // A `-- allow full read` comment on this line (or the line above)
+            // opts this specific run/run1 out of the full-read warning — the
+            // same source may be read partially elsewhere.
+            if !self.suppresses_full_read_warning(expr.span) {
+                self.in_memory_source_reads
+                    .insert(source_name.clone(), (expr.span, fn_name.to_string()));
+            }
             self.emit_stm_track_read(builder, &source_name);
             let (name_ptr, name_len) = self.string_ptr(builder, &source_name);
             let (schema_ptr, schema_len) = self.string_ptr(builder, &schema);
@@ -16386,6 +16391,17 @@ impl<M: cranelift_module::Module> Codegen<M> {
     /// every codegen path that emits one of them must call this for every
     /// table the query touches — otherwise an STM `retry` watching the
     /// table is never woken by writes to it.
+    /// Whether the full-read warning is suppressed for the `run`/`run1` call at
+    /// `span` — a `-- allow full read` comment on that line (a trailing comment).
+    fn suppresses_full_read_warning(&self, span: ast::Span) -> bool {
+        let (line, _) = knot::diagnostic::line_col(&self.source_text, span.start);
+        // Only the run's own line — a trailing `-- allow full read` on it.
+        self.source_text
+            .lines()
+            .nth(line.saturating_sub(1))
+            .is_some_and(|l| l.contains("-- allow full read"))
+    }
+
     fn emit_stm_track_read(&mut self, builder: &mut FunctionBuilder, source_name: &str) {
         let (tn_ptr, tn_len) = self.string_ptr(builder, source_name);
         self.call_rt_void(builder, "knot_stm_track_read", &[tn_ptr, tn_len]);

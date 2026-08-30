@@ -10938,6 +10938,27 @@ impl Infer {
             );
         }
 
+        // run1 : ∀a. [a] -> IO a
+        // Extract the single row of a one-element relation, erroring unless it
+        // holds exactly one row. The scalar extractor for the aggregates/tests
+        // (count, sum, any, …).
+        {
+            let a = self.fresh_var();
+            self.bind_top(
+                "run1",
+                Scheme {
+                    vars: vec![a],
+                    unit_vars: vec![],
+                    constraints: vec![],
+                    unit_binops: vec![],
+                    ty: Ty::Fun(
+                        Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
+                        Box::new(Ty::IO(Box::new(Ty::Var(a)))),
+                    ),
+                },
+            );
+        }
+
         // vecCount : ∀a u. Vec a -> Int u  — the `Vec` overload of `count`.
         // Resolved via `^count`: `base.count : [a] -> Int u` and
         // `base.vec.count : Vec a -> Int u` are the two candidates; the

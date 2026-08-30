@@ -6538,6 +6538,29 @@ pub extern "C-unwind" fn knot_relation_run_io(rel: *mut Value) -> *mut Value {
     alloc_io_leaf(thunk as *const u8, env, "run", true)
 }
 
+/// `run1` — extract the single row of a relation as an IO, erroring unless the
+/// relation holds exactly one row. The scalar extractor for the one-element
+/// relations the aggregates/tests produce (count, sum, any, …).
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_relation_run1(rel: *mut Value) -> *mut Value {
+    let env = rel;
+    extern "C-unwind" fn thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
+        let _ = db;
+        match unsafe { as_ref(env) } {
+            Value::Relation(rows) if rows.len() == 1 => rows[0],
+            Value::Relation(rows) => panic!(
+                "knot runtime: run1 expected exactly one row, got {}",
+                rows.len()
+            ),
+            _ => panic!(
+                "knot runtime: run1 expected a relation, got {}",
+                type_name(env)
+            ),
+        }
+    }
+    alloc_io_leaf(thunk as *const u8, env, "run1", true)
+}
+
 /// Take the first `n` elements from a relation.
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_relation_take(n_val: *mut Value, rel: *mut Value) -> *mut Value {

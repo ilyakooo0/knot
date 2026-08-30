@@ -1556,6 +1556,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
         self.declare_rt("knot_relation_extend", &[p, p], &[]);
         self.declare_rt("knot_relation_len", &[p], &[p]);
         self.declare_rt("knot_relation_run_io", &[p], &[p]);
+        self.declare_rt("knot_relation_run1", &[p], &[p]);
         self.declare_rt("knot_relation_get", &[p, p], &[p]);
         self.declare_rt("knot_relation_tail", &[p], &[p]);
         self.declare_rt("knot_relation_union", &[p, p, p], &[p]);
@@ -2631,6 +2632,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
             "writeFile",
             "appendFile",
             "run",
+            "run1",
             "fileExists",
             "removeFile",
             "listDir",
@@ -3532,6 +3534,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
         // File system: 1-param (IO-returning)
         self.define_stdlib_fn_1("readFile", "knot_fs_read_file_io");
         self.define_stdlib_fn_1("run", "knot_relation_run_io");
+        self.define_stdlib_fn_1("run1", "knot_relation_run1");
         self.define_stdlib_fn_1("fileExists", "knot_fs_file_exists_io");
         self.define_stdlib_fn_1("removeFile", "knot_fs_remove_file_io");
         self.define_stdlib_fn_1("listDir", "knot_fs_list_dir_io");

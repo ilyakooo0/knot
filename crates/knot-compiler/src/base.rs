@@ -189,6 +189,7 @@ pub(crate) const BASE_STDLIB_FNS: &[&str] = &[
     "removeFile",
     "reverse",
     "run",
+    "run1",
     "sign",
     "sleep",
     "sortBy",

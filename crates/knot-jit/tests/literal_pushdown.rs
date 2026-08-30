@@ -131,3 +131,25 @@ fn inter_source_and_literal_pushes_down() {
     assert!(stdout.contains("{age 30  name a}") && !stdout.contains("name b") && !stdout.contains("name c"),
         "expected only the shared row, got:\n{stdout}");
 }
+
+#[test]
+fn run1_extracts_the_single_row() {
+    // run1 (count ...) extracts the scalar from the one-element relation.
+    let (stdout, _, code) = e2e::run_program(
+        "run1_ok",
+        "(| c <- base.run1 (base.count [1  2  3]); base.println (base.show c); yield {})\n",
+    );
+    assert_eq!(code, 0);
+    assert!(stdout.contains("3"), "expected the count 3, got:\n{stdout}");
+}
+
+#[test]
+fn run1_errors_on_a_multi_row_relation() {
+    // run1 on a multi-row relation errors (not exactly one row).
+    let (_stdout, stderr, code) = e2e::run_program(
+        "run1_err",
+        "(| c <- base.run1 [1  2  3]; base.println (base.show c); yield {})\n",
+    );
+    assert_ne!(code, 0, "run1 on a 3-row relation should fail");
+    assert!(stderr.contains("run1 expected exactly one row"), "expected the run1 error, got:\n{stderr}");
+}

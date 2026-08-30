@@ -248,6 +248,10 @@ pub struct Codegen<M: cranelift_module::Module = ObjectModule> {
     // Surfaced as a build-time INFO diagnostic naming each such table.
     in_memory_source_reads: HashMap<String, ast::Span>,
 
+    /// Source name → its `*name` declaration span (for the full-read warning's
+    /// trace back to where the relation is declared).
+    source_decl_spans: HashMap<String, ast::Span>,
+
     // Resolved monad types for desugared do-blocks (from type inference)
     monad_info: MonadInfo,
 
@@ -1110,6 +1114,10 @@ fn compile_inner<M: cranelift_module::Module>(
         ));
         for (name, span) in &entries {
             diag = diag.label(**span, format!("`*{name}` is read in full here"));
+            // Trace back to the source's declaration.
+            if let Some(decl_span) = cg.source_decl_spans.get(*name) {
+                diag = diag.label(*decl_span, format!("`*{name}` is declared here"));
+            }
         }
         diag = diag
             .note("to read only part of it, filter or narrow the query (a `where` clause, `base.take`) so only the matching rows are loaded")
@@ -1462,6 +1470,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
             capture_env_in_progress: std::collections::HashSet::new(),
             relational_do_spans: HashSet::new(),
             in_memory_source_reads: HashMap::new(),
+            source_decl_spans: HashMap::new(),
             monad_info: HashMap::new(),
             nullable_ctors: HashMap::new(),
             io_functions: HashSet::new(),
@@ -2512,6 +2521,13 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         seen.insert(decl.name, decl.span);
                     }
                 }
+            }
+        }
+        // Map each source to its `*name` declaration span, for the full-read
+        // warning's trace back to where the relation is declared.
+        for decl in decl_views(program) {
+            if matches!(decl.kind, DeclViewKind::Source { .. }) {
+                self.source_decl_spans.insert(decl.name.to_string(), decl.span);
             }
         }
         // Register built-in ADT constructors so trait dispatchers can find their

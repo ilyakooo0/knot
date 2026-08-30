@@ -246,7 +246,8 @@ pub struct Codegen<M: cranelift_module::Module = ObjectModule> {
     // Source tables read fully into memory (not pushed down to SQL): the
     // `run *source` fast path and the in-memory `knot_source_read` fallback.
     // Surfaced as a build-time INFO diagnostic naming each such table.
-    in_memory_source_reads: HashMap<String, ast::Span>,
+    // Maps the source name → (read span, the function that read it: run/run1/…).
+    in_memory_source_reads: HashMap<String, (ast::Span, String)>,
 
     /// Source name → its `*name` declaration span (for the full-read warning's
     /// trace back to where the relation is declared).
@@ -1100,7 +1101,7 @@ fn compile_inner<M: cranelift_module::Module>(
     // memory instead of pushing the query down to SQL. One diagnostic listing
     // every such table; advice only — it never fails the build.
     if !cg.in_memory_source_reads.is_empty() {
-        let mut entries: Vec<(&String, &ast::Span)> = cg.in_memory_source_reads.iter().collect();
+        let mut entries: Vec<(&String, &(ast::Span, String))> = cg.in_memory_source_reads.iter().collect();
         entries.sort_by_key(|(n, _)| (*n).clone());
         let names = entries
             .iter()
@@ -1112,8 +1113,8 @@ fn compile_inner<M: cranelift_module::Module>(
             names,
             if entries.len() == 1 { "" } else { "s" },
         ));
-        for (name, span) in &entries {
-            diag = diag.label(**span, format!("`*{name}` is read in full here"));
+        for (name, (span, how)) in &entries {
+            diag = diag.label(*span, format!("`*{name}` is read in full here ({how})"));
             // Trace back to the source's declaration.
             if let Some(decl_span) = cg.source_decl_spans.get(*name) {
                 diag = diag.label(*decl_span, format!("`*{name}` is declared here"));
@@ -5005,7 +5006,8 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 // SQL-pushdown matcher — it loads the whole relation into
                 // memory via `knot_source_read`. Track it for the build-time
                 // INFO diagnostic naming full in-memory reads.
-                self.in_memory_source_reads.insert(name.clone(), expr.span);
+                self.in_memory_source_reads
+                    .insert(name.clone(), (expr.span, "a direct read".to_string()));
                 let schema = self.source_schemas.get(name).cloned().unwrap_or_default();
                 let (name_ptr, name_len) = self.string_ptr(builder, name);
                 let (schema_ptr, schema_len) = self.string_ptr(builder, &schema);
@@ -7194,7 +7196,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
             && let Some(schema) = self.source_schemas.get(&source_name).cloned()
         {
             self.in_memory_source_reads
-                .insert(source_name.clone(), args[0].span);
+                .insert(source_name.clone(), (args[0].span, "base.run".to_string()));
             self.emit_stm_track_read(builder, &source_name);
             let (name_ptr, name_len) = self.string_ptr(builder, &source_name);
             let (schema_ptr, schema_len) = self.string_ptr(builder, &schema);

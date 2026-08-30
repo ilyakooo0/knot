@@ -1103,27 +1103,22 @@ fn compile_inner<M: cranelift_module::Module>(
     if !cg.in_memory_source_reads.is_empty() {
         let mut entries: Vec<(&String, &(ast::Span, String))> = cg.in_memory_source_reads.iter().collect();
         entries.sort_by_key(|(n, _)| (*n).clone());
-        let names = entries
-            .iter()
-            .map(|(n, _)| format!("`*{n}`"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let mut diag = knot::diagnostic::Diagnostic::warning(format!(
-            "reads the whole {} relation{} into memory",
-            names,
-            if entries.len() == 1 { "" } else { "s" },
-        ));
         for (name, (span, how)) in &entries {
-            diag = diag.label(*span, format!("`*{name}` is read in full here ({how})"));
-            // Trace back to the source's declaration.
+            // One warning per source: the read site (primary) plus the
+            // declaration it reads. Clear which relation, which read, and where
+            // it's declared.
+            let mut diag = knot::diagnostic::Diagnostic::warning(format!(
+                "`{how}` reads the whole `*{name}` relation into memory",
+            ));
+            diag = diag.label(*span, format!("this reads all of `*{name}`"));
             if let Some(decl_span) = cg.source_decl_spans.get(*name) {
                 diag = diag.label(*decl_span, format!("`*{name}` is declared here"));
             }
+            diag = diag
+                .note("to read only part of it, filter or narrow the query (a `where` clause, `base.take`) so only the matching rows are loaded")
+                .note("if you only need a number, use an aggregate (base.count, base.sum) instead of reading the rows");
+            eprintln!("{}", diag.render(&cg.source_text, &cg.source_name));
         }
-        diag = diag
-            .note("to read only part of it, filter or narrow the query (a `where` clause, `base.take`) so only the matching rows are loaded")
-            .note("if you only need a number, use an aggregate (base.count, base.sum) instead of reading the rows");
-        eprintln!("{}", diag.render(&cg.source_text, &cg.source_name));
     }
     Ok(cg)
 }
@@ -7197,7 +7192,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
         {
             let fn_name = Self::query_form_name(func_expr).unwrap();
             self.in_memory_source_reads
-                .insert(source_name.clone(), (args[0].span, format!("base.{fn_name}")));
+                .insert(source_name.clone(), (expr.span, format!("base.{fn_name}")));
             self.emit_stm_track_read(builder, &source_name);
             let (name_ptr, name_len) = self.string_ptr(builder, &source_name);
             let (schema_ptr, schema_len) = self.string_ptr(builder, &schema);

@@ -7185,18 +7185,19 @@ impl<M: cranelift_module::Module> Codegen<M> {
             return v;
         }
 
-        // Special case: `run *source` — the explicit query→data boundary. Reads
-        // the whole source into memory (a full in-memory read, reported by the
-        // build-time Advice) and wraps the materialized relation as
-        // `IO (Vec a)` via `knot_relation_run_io`.
-        if Self::query_form_name(func_expr) == Some("run")
+        // Special case: `run *source` / `run1 *source` — the explicit query→data
+        // boundary. Reads the whole source into memory (a full in-memory read,
+        // reported by the build-time Warning) and wraps the materialized
+        // relation as `IO (Vec a)` / `IO a`.
+        if matches!(Self::query_form_name(func_expr), Some("run") | Some("run1"))
             && args.len() == 1
             && !user_shadows_special
             && let Some(source_name) = self.resolve_source(args[0])
             && let Some(schema) = self.source_schemas.get(&source_name).cloned()
         {
+            let fn_name = Self::query_form_name(func_expr).unwrap();
             self.in_memory_source_reads
-                .insert(source_name.clone(), (args[0].span, "base.run".to_string()));
+                .insert(source_name.clone(), (args[0].span, format!("base.{fn_name}")));
             self.emit_stm_track_read(builder, &source_name);
             let (name_ptr, name_len) = self.string_ptr(builder, &source_name);
             let (schema_ptr, schema_len) = self.string_ptr(builder, &schema);
@@ -7205,7 +7206,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 "knot_source_read",
                 &[db, name_ptr, name_len, schema_ptr, schema_len],
             );
-            return self.call_rt(builder, "knot_relation_run_io", &[rel]);
+            // run → IO (Vec a); run1 → IO a (the single row).
+            let rt = if fn_name == "run1" { "knot_relation_run1" } else { "knot_relation_run_io" };
+            return self.call_rt(builder, rt, &[rel]);
         }
 
         // Special case: count *rel → SQL COUNT(*)  (bare `count` or `base.count`)

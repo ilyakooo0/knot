@@ -7192,7 +7192,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
         {
             let fn_name = Self::query_form_name(func_expr).unwrap();
             self.in_memory_source_reads
-                .insert(source_name.clone(), (expr.span, format!("base.{fn_name}")));
+                .insert(source_name.clone(), (expr.span, fn_name.to_string()));
             self.emit_stm_track_read(builder, &source_name);
             let (name_ptr, name_len) = self.string_ptr(builder, &source_name);
             let (schema_ptr, schema_len) = self.string_ptr(builder, &schema);

@@ -1104,16 +1104,16 @@ fn compile_inner<M: cranelift_module::Module>(
             .collect::<Vec<_>>()
             .join(", ");
         let mut diag = knot::diagnostic::Diagnostic::info(format!(
-            "full in-memory table read{}: {}",
+            "reads the whole {} relation{} into memory",
+            names,
             if entries.len() == 1 { "" } else { "s" },
-            names
         ));
         for (name, span) in &entries {
-            diag = diag.label(**span, format!("`{name}` is loaded fully into memory here"));
+            diag = diag.label(**span, format!("`{name}` is read in full here"));
         }
         diag = diag
-            .note("the query is materialized by `base.run` without SQL pushdown, so the whole table is loaded into memory")
-            .note("to resolve: express the filter/projection in the query so the planner pushes it down to SQL; narrow with `where`/`take`; or use `base.count`/`base.sum` when you only need an aggregate");
+            .note("to read only part of it, filter or narrow the query (a `where` clause, `base.take`) so only the matching rows are loaded")
+            .note("if you only need a number, use an aggregate (base.count, base.sum) instead of reading the rows");
         eprintln!("{}", diag.render(&cg.source_text, &cg.source_name));
     }
     Ok(cg)

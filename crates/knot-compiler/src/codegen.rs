@@ -1103,7 +1103,7 @@ fn compile_inner<M: cranelift_module::Module>(
             .map(|(n, _)| format!("`*{n}`"))
             .collect::<Vec<_>>()
             .join(", ");
-        let mut diag = knot::diagnostic::Diagnostic::info(format!(
+        let mut diag = knot::diagnostic::Diagnostic::warning(format!(
             "reads the whole {} relation{} into memory",
             names,
             if entries.len() == 1 { "" } else { "s" },

@@ -622,7 +622,6 @@ impl Parser {
                 Ok((n, tok.span))
             }
             TokenKind::Where
-            | TokenKind::Not
             | TokenKind::Full
             | TokenKind::Atomic
             | TokenKind::With
@@ -1690,24 +1689,6 @@ impl Parser {
                 let lit = self.maybe_time_unit(lit)?;
                 let lit = self.parse_postfix_from(lit)?;
                 self.parse_application_from(lit)
-            }
-            TokenKind::Not => {
-                if !self.enter_recursion() {
-                    return None;
-                }
-                let start = self.span();
-                self.advance();
-                let operand = self.parse_unary();
-                self.recursion_depth -= 1;
-                let operand = operand?;
-                let span = Span::new(start.start, operand.span.end);
-                Some(Spanned::new(
-                    ExprKind::UnaryOp {
-                        op: UnaryOp::Not,
-                        operand: Box::new(operand),
-                    },
-                    span,
-                ))
             }
             _ => self.parse_application(),
         }

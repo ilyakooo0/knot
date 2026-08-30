@@ -7519,8 +7519,16 @@ impl Infer {
                         self.degrade_refinement(operand_ty, operand.span)
                     }
                     ast::UnaryOp::Not => {
-                        self.unify(&operand_ty, &Ty::Bool, operand.span);
-                        Ty::Bool
+                        let applied = self.apply(&operand_ty);
+                        // `not` lifts over a relation of bools: `not (Rel Bool)`
+                        // maps the negation, yielding `Rel Bool` (so `not (elem
+                        // ...)` works). A bare Bool negates directly.
+                        if matches!(&applied, Ty::Relation(inner) if matches!(**inner, Ty::Bool)) {
+                            applied
+                        } else {
+                            self.unify(&operand_ty, &Ty::Bool, operand.span);
+                            Ty::Bool
+                        }
                     }
                 }
             }

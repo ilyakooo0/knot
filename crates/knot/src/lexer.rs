@@ -545,7 +545,6 @@ impl<'src> Lexer<'src> {
         if first.is_ascii_lowercase() || first == b'_' {
             match text {
                 "where" => return TokenKind::Where,
-                "not" => return TokenKind::Not,
                 "full" => return TokenKind::Full,
                 "atomic" => return TokenKind::Atomic,
                 "with" => return TokenKind::With,

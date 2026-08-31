@@ -165,6 +165,10 @@ pub enum ExprKind {
     /// `42`, `3.14`, `"hello"`
     Lit(Literal),
 
+    /// `nameOf x` — the qualified path of the value `x` resolves to
+    /// (file.knot:line:name), as a compile-time string.
+    NameOf(Box<Expr>),
+
     /// `x`, `formatTitle` — lowercase identifier.
     Var(Binding),
 

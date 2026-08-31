@@ -364,6 +364,7 @@ fn shift_expr_spans(e: &mut ast::Expr, offset: usize) {
     e.span.end += offset;
     match &mut e.node {
         TypeLiteral(_) => {}
+        NameOf(inner) => shift_expr_spans(inner, offset),
         App { func, arg } => {
             shift_expr_spans(func, offset);
             shift_expr_spans(arg, offset);

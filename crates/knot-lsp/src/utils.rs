@@ -477,6 +477,7 @@ pub fn top_fields(program: &Expr) -> Vec<&RecordField> {
 
 pub fn recurse_expr<F: FnMut(&ast::Expr)>(expr: &ast::Expr, mut f: F) {
     match &expr.node {
+        ast::ExprKind::NameOf(inner) => f(inner),
         ast::ExprKind::TypeLiteral(_) => {}
         ast::ExprKind::App { func, arg } => {
             f(func);

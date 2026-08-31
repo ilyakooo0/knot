@@ -4830,6 +4830,16 @@ impl<M: cranelift_module::Module> Codegen<M> {
         match &expr.node {
             ast::ExprKind::Lit(lit) => self.compile_lit(builder, lit, expr.span),
 
+            // `nameOf x` — the qualified path of the value `x` resolves to
+            // (file.knot:line:name), as a compile-time string. Resolves through
+            // let-bindings (the same resolution as accessing the value).
+            ast::ExprKind::NameOf(operand) => {
+                let path = self.nameof_path(operand);
+                let (ptr, len) = self.string_ptr(builder, &path);
+                let slot = self.text_literal_slot(builder, &path);
+                self.call_rt(builder, "knot_value_text_intern", &[ptr, len, slot])
+            }
+
             // `_` in value position: a TypeHole behaves exactly like
             // `base.todo` — report the expected type + scope and exit.
             ast::ExprKind::TypeHole => self.emit_todo(builder, expr.span, env),
@@ -6343,6 +6353,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     || matches!(name, "yield" | "__bind" | "__yield" | "__empty"))
         };
         match &expr.node {
+            ast::ExprKind::NameOf(_) => false,
             Set { target, value } | FullSet { target, value } => {
                 let target_ok = match &target.node {
                     SourceRef { name, .. } => {
@@ -13294,6 +13305,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
     fn references_source(expr: &ast::Expr, source_name: &str) -> bool {
         match &expr.node {
             ast::ExprKind::SourceRef { name, .. } => name == source_name,
+            ast::ExprKind::NameOf(inner) => Self::references_source(inner, source_name),
             ast::ExprKind::ImplicitRef(_) => false,
             ast::ExprKind::CollectFold(_) => false,
             ast::ExprKind::TypeHole => false,
@@ -16381,6 +16393,41 @@ impl<M: cranelift_module::Module> Codegen<M> {
         rel
     }
 
+    /// The qualified path of a value's original binding: `file.knot:line:name`.
+    /// Resolves through let-bindings (the same resolution as accessing the
+    /// value), so `nameOf y` where `y = x` gives `x`'s path.
+    fn nameof_path(&self, expr: &ast::Expr) -> String {
+        // The innermost named binding in the expression. For a source, the
+        // source name. For a variable, the binding's name (resolved through
+        // let-bindings). For anything else, the expression's span as a fallback.
+        let name = self.resolve_binding_name(expr);
+        // The line is the binding's declaration, not the reference. For a
+        // source, the source's declaration span; for a variable, the reference.
+        let span = if let Some(source_name) = self.resolve_source(expr) {
+            self.source_decl_spans.get(&source_name).copied().unwrap_or(expr.span)
+        } else {
+            expr.span
+        };
+        let (line, _) = knot::diagnostic::line_col(&self.source_text, span.start);
+        format!("{}:{}:{}", self.source_name, line, name)
+    }
+
+    /// Resolve a value's binding name (the innermost named binding). For a
+    /// source, the source name. For a variable, resolve through the binding to
+    /// the source (the same resolution as accessing the value), or the binding's
+    /// name if it's not a source.
+    fn resolve_binding_name(&self, expr: &ast::Expr) -> String {
+        // Resolve the value the way accessing it would: a source ref, or a var
+        // bound to a source (via let/source_var_binds).
+        if let Some(source_name) = self.resolve_source(expr) {
+            return source_name;
+        }
+        match &expr.node {
+            ast::ExprKind::Var(binding) => binding.as_user().unwrap_or("?").to_string(),
+            _ => format!("expr@{}", expr.span.start),
+        }
+    }
+
     /// Emit a runtime `knot_stm_track_read_pred` call refining the most-recent
     /// `All` filter for this table into a richer `Cols` filter built from
     /// `preds`. No-op when `preds` is `None` (the broad `knot_stm_track_read`
@@ -18456,6 +18503,7 @@ fn beta_reduce_inner(
     *fuel -= 1;
     let span = expr.span;
     let new_node = match &expr.node {
+        NameOf(inner) => NameOf(Box::new(beta_reduce_inner(inner, let_bindings, fun_bodies, visited, fuel))),
         Var(name) => {
             if !visited.contains(name.as_str()) {
                 // Local let bindings shadow top-level functions: a let
@@ -18670,6 +18718,7 @@ fn substitute_inner(
     use ast::ExprKind::*;
     let span = expr.span;
     let new_node = match &expr.node {
+        NameOf(inner) => NameOf(Box::new(substitute(inner, var, value)?)),
         Var(name) if name == var => return Some(value.clone()),
         Var(_)
         | Lit(_)
@@ -18797,6 +18846,7 @@ fn expr_mentions_var(expr: &ast::Expr, var: &str) -> bool {
     };
     match &expr.node {
         Var(name) => name == var,
+        NameOf(inner) => expr_mentions_var(inner, var),
         Lit(_)
         | Constructor(_)
         | SourceRef { .. }
@@ -18846,6 +18896,7 @@ fn collect_free_vars_set(expr: &ast::Expr, bound: &HashSet<String>, free: &mut H
                 free.insert(name.as_str().to_string());
             }
         }
+        NameOf(inner) => collect_free_vars_set(inner, bound, free),
         Lit(_)
         | Constructor(_)
         | SourceRef { .. }
@@ -20073,6 +20124,7 @@ fn collect_free_vars(expr: &ast::Expr, bound: &HashSet<&str>, free: &mut Vec<Str
                 free.push(name.as_str().to_string());
             }
         }
+        ast::ExprKind::NameOf(inner) => collect_free_vars(inner, bound, free),
         ast::ExprKind::Lit(_) | ast::ExprKind::Constructor(_) => {}
         ast::ExprKind::SourceRef { .. } => {}
         ast::ExprKind::SourceDecl { .. } => {}
@@ -20234,6 +20286,7 @@ pub(crate) fn expr_refs_var(expr: &ast::Expr, var: &str) -> bool {
     let pat_binds_var = |pat: &ast::Pat| pat_bound_names(pat).iter().any(|n| n == var);
     match &expr.node {
         ast::ExprKind::Var(name) => name == var,
+        ast::ExprKind::NameOf(inner) => expr_refs_var(inner, var),
         ast::ExprKind::Lit(_)
         | ast::ExprKind::Constructor(_)
         | ast::ExprKind::SourceRef { .. }
@@ -20326,6 +20379,7 @@ fn expr_uses_var_as_value(expr: &ast::Expr, var: &str) -> bool {
     let pat_binds_var = |pat: &ast::Pat| pat_bound_names(pat).iter().any(|n| n == var);
     match &expr.node {
         ast::ExprKind::Var(name) => name == var,
+        ast::ExprKind::NameOf(inner) => expr_uses_var_as_value(inner, var),
         ast::ExprKind::Lit(_)
         | ast::ExprKind::Constructor(_)
         | ast::ExprKind::SourceRef { .. }
@@ -20637,6 +20691,7 @@ pub(crate) fn expr_has_tag_column(
 fn pretty_expr(expr: &ast::Expr) -> String {
     match &expr.node {
         ast::ExprKind::Lit(lit) => pretty_lit(lit),
+        ast::ExprKind::NameOf(inner) => format!("nameOf {}", pretty_expr(inner)),
         ast::ExprKind::Var(name) => name.as_str().to_string(),
         ast::ExprKind::ImplicitRef(name) => format!("^{name}"),
         ast::ExprKind::CollectFold(name) => format!("<>{name}"),

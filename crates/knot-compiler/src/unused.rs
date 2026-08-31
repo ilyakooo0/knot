@@ -213,6 +213,7 @@ fn walk_route_entry(e: &RouteEntry, r: &mut Refs) {
 
 fn walk_expr(e: &Expr, r: &mut Refs) {
     match &e.node {
+        ExprKind::NameOf(inner) => walk_expr(inner, r),
         ExprKind::TypeLiteral(_) => {}
         ExprKind::Lit(_) => {}
         // `^x` reads a field of an in-scope record, but which record is only

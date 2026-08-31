@@ -64,6 +64,7 @@ fn lint_expr(
     diags: &mut Vec<Diagnostic>,
 ) {
     match &expr.node {
+        ExprKind::NameOf(inner) => lint_expr(inner, source_schemas, views, fun_bodies, diags),
         ExprKind::Set { target, value } => {
             if let ExprKind::SourceRef { name, .. } = &target.node {
                 if let Some(schema) = source_schemas.get(name) {
@@ -919,6 +920,7 @@ fn match_filter_only<'a>(source_name: &str, value: &'a Expr) -> Option<(String, 
 fn references_source(expr: &Expr, source_name: &str) -> bool {
     match &expr.node {
         ExprKind::SourceRef { name, .. } => name == source_name,
+        ExprKind::NameOf(inner) => references_source(inner, source_name),
         ExprKind::Lit(_)
         | ExprKind::Var(_)
         | ExprKind::Constructor(_)

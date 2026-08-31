@@ -6214,6 +6214,13 @@ impl Infer {
     fn infer_expr_inner(&mut self, expr: &ast::Expr) -> Ty {
         match &expr.node {
             ast::ExprKind::Lit(lit) => self.literal_type(lit, expr.span),
+            // `nameOf x` — the qualified path of the value `x` resolves to, as a
+            // compile-time string. The type is Text; the operand is type-checked
+            // (its provenance is resolved at codegen).
+            ast::ExprKind::NameOf(operand) => {
+                self.infer_expr(operand);
+                Ty::Text
+            }
             // A type literal is only meaningful as a type-witness argument,
             // consumed by the application diversion before inference reaches
             // here. Standalone it's an error.
@@ -13738,6 +13745,7 @@ fn value_references_source_inner(
 ) -> bool {
     match &expr.node {
         ast::ExprKind::SourceRef { name, .. } => name == source_name,
+        ast::ExprKind::NameOf(inner) => value_references_source_inner(inner, source_name, aliases, let_bindings, visited),
         // `^x` reads a record field, never a source relation directly.
         ast::ExprKind::ImplicitRef(_) => false,
         // A type literal has no expression content.
@@ -15340,6 +15348,7 @@ fn rewrite_result_markers(expr: &mut ast::Expr, pure_spans: &HashSet<Span>) {
 fn walk_expr_children_mut(expr: &mut ast::Expr, f: &mut impl FnMut(&mut ast::Expr)) {
     use ast::ExprKind::*;
     match &mut expr.node {
+        NameOf(inner) => f(inner),
         Lit(_) | Var(_) | Constructor(_) | SourceRef { .. } | ImplicitRef(_) | CollectFold(_) => {}
         TypeHole => {}
         TypeLiteral(_) => {}

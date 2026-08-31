@@ -703,6 +703,7 @@ fn desugar_expr(expr: &mut Expr, io_fns: &IoFns, source_vars: &HashSet<String>) 
 /// by the caller).
 fn recurse_into_children(expr: &mut Expr, io_fns: &IoFns, source_vars: &HashSet<String>) {
     match &mut expr.node {
+        ExprKind::NameOf(inner) => recurse_into_children(inner, io_fns, source_vars),
         ExprKind::Lit(_)
         | ExprKind::Var(_)
         | ExprKind::TypeLiteral(_)

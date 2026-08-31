@@ -1690,8 +1690,18 @@ impl Parser {
                 let lit = self.parse_postfix_from(lit)?;
                 self.parse_application_from(lit)
             }
+            TokenKind::NameOf => self.parse_nameof(),
             _ => self.parse_application(),
         }
+    }
+
+    /// `nameOf x` — the qualified path of the value `x` resolves to.
+    fn parse_nameof(&mut self) -> Option<Expr> {
+        let start = self.span();
+        self.advance(); // nameOf
+        let operand = self.parse_unary()?;
+        let span = Span::new(start.start, operand.span.end);
+        Some(Spanned::new(ExprKind::NameOf(Box::new(operand)), span))
     }
 
     fn parse_application(&mut self) -> Option<Expr> {

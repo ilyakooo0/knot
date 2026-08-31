@@ -418,6 +418,10 @@ impl<'a> TokenCollector<'a> {
 
     fn visit_expr(&mut self, expr: &ast::Expr) {
         match &expr.node {
+            ast::ExprKind::NameOf(inner) => {
+                self.add(self.strip_parens(expr.span), TOK_FUNCTION, 0);
+                self.visit_expr(inner);
+            }
             ast::ExprKind::Var(name) => {
                 let modifier = if EFFECTFUL_BUILTINS.contains(&name.as_str()) {
                     MOD_EFFECTFUL

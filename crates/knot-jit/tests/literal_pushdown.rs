@@ -53,7 +53,7 @@ fn record_literal_cross_join_pushes_down() {
 fn mixed_comprehension_correct_rows() {
     let (stdout, _stderr, code) = e2e::run_program(
         "xcj",
-        "with {\nPerson  {name Text  age (Int 1)}\nRel Person  *people\npairs  (|\n  p <- *people\n  x <- [100  200]\n  yield {name p.name  n (p.age + x)})\n}\n(| full *people = [{name \"a\"  age 30}]; base.println (base.show pairs); yield {})\n",
+        "with {\nPerson  {name Text  age (Int 1)}\nRel Person  *people\npairs  (|\n  p <- *people\n  x <- [100  200]\n  yield {name p.name  n (p.age + x)})\n}\n(| *people = [{name \"a\"  age 30}]; base.println (base.show pairs); yield {})\n",
     );
     assert_eq!(code, 0);
     // Cross product: the one person × the two literal scalars.
@@ -67,7 +67,7 @@ fn where_over_literal_column_pushes_down() {
     // a SQL WHERE (not materialize).
     let stderr = build_stderr(
         "wlc",
-        "with {\nPerson  {name Text  age (Int 1)}\nRel Person  *people\nfiltered  (|\n  p <- *people\n  x <- [100  200]\n  where x > 150\n  yield {name p.name  n (p.age + x)})\n}\n(| full *people = [{name \"a\"  age 30}]; base.println (base.show filtered); yield {})\n",
+        "with {\nPerson  {name Text  age (Int 1)}\nRel Person  *people\nfiltered  (|\n  p <- *people\n  x <- [100  200]\n  where x > 150\n  yield {name p.name  n (p.age + x)})\n}\n(| *people = [{name \"a\"  age 30}]; base.println (base.show filtered); yield {})\n",
     );
     assert!(
         !stderr.contains("in-memory table read"),
@@ -75,7 +75,7 @@ fn where_over_literal_column_pushes_down() {
     );
     let (stdout, _, code) = e2e::run_program(
         "wlc",
-        "with {\nPerson  {name Text  age (Int 1)}\nRel Person  *people\nfiltered  (|\n  p <- *people\n  x <- [100  200]\n  where x > 150\n  yield {name p.name  n (p.age + x)})\n}\n(| full *people = [{name \"a\"  age 30}]; base.println (base.show filtered); yield {})\n",
+        "with {\nPerson  {name Text  age (Int 1)}\nRel Person  *people\nfiltered  (|\n  p <- *people\n  x <- [100  200]\n  where x > 150\n  yield {name p.name  n (p.age + x)})\n}\n(| *people = [{name \"a\"  age 30}]; base.println (base.show filtered); yield {})\n",
     );
     assert_eq!(code, 0);
     // Only x=200 survives (200 > 150), so n = 30 + 200 = 230.
@@ -89,7 +89,7 @@ fn literal_column_arithmetic_stays_int() {
     // Int (not the float fallback), so the result renders as integers.
     let (stdout, _, code) = e2e::run_program(
         "lci",
-        "with {\nPerson  {name Text  age (Int 1)}\nRel Person  *people\npairs  (|\n  p <- *people\n  x <- [100  200]\n  yield {name p.name  n (p.age + x)})\n}\n(| full *people = [{name \"a\"  age 30}]; base.println (base.show (base.map (\\r -> r.n) pairs)); yield {})\n",
+        "with {\nPerson  {name Text  age (Int 1)}\nRel Person  *people\npairs  (|\n  p <- *people\n  x <- [100  200]\n  yield {name p.name  n (p.age + x)})\n}\n(| *people = [{name \"a\"  age 30}]; base.println (base.show (base.map (\\r -> r.n) pairs)); yield {})\n",
     );
     assert_eq!(code, 0);
     // Integers, not floats (a float mistype would render 130.0 / 230.0).
@@ -103,7 +103,7 @@ fn union_source_and_literal_pushes_down() {
     // literal is an inline subquery — a single UNION query, no materialization.
     let stderr = build_stderr(
         "usl",
-        "with {\nPerson  {name Text  age (Int 1)}\nRel Person  *people\n}\n(| full *people = [{name \"a\"  age 30}]; base.println (base.show (base.union *people [{name \"c\"  age 50}])); yield {})\n",
+        "with {\nPerson  {name Text  age (Int 1)}\nRel Person  *people\n}\n(| *people = [{name \"a\"  age 30}]; base.println (base.show (base.union *people [{name \"c\"  age 50}])); yield {})\n",
     );
     assert!(
         !stderr.contains("in-memory table read"),
@@ -111,7 +111,7 @@ fn union_source_and_literal_pushes_down() {
     );
     let (stdout, _, code) = e2e::run_program(
         "usl",
-        "with {\nPerson  {name Text  age (Int 1)}\nRel Person  *people\n}\n(| full *people = [{name \"a\"  age 30}]; base.println (base.show (base.union *people [{name \"c\"  age 50}])); yield {})\n",
+        "with {\nPerson  {name Text  age (Int 1)}\nRel Person  *people\n}\n(| *people = [{name \"a\"  age 30}]; base.println (base.show (base.union *people [{name \"c\"  age 50}])); yield {})\n",
     );
     assert_eq!(code, 0);
     assert!(stdout.contains("{age 30  name a}") && stdout.contains("{age 50  name c}"),
@@ -124,7 +124,7 @@ fn inter_source_and_literal_pushes_down() {
     // in SQL.
     let (stdout, _, code) = e2e::run_program(
         "isl",
-        "with {\nPerson  {name Text  age (Int 1)}\nRel Person  *people\n}\n(| full *people = [{name \"a\"  age 30}  {name \"b\"  age 10}]; base.println (base.show (base.inter *people [{name \"a\"  age 30}  {name \"c\"  age 50}])); yield {})\n",
+        "with {\nPerson  {name Text  age (Int 1)}\nRel Person  *people\n}\n(| *people = [{name \"a\"  age 30}  {name \"b\"  age 10}]; base.println (base.show (base.inter *people [{name \"a\"  age 30}  {name \"c\"  age 50}])); yield {})\n",
     );
     assert_eq!(code, 0);
     // Only {a 30} is in both.

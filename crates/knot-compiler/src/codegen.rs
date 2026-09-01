@@ -6080,53 +6080,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 }
             }
 
-            ast::ExprKind::FullSet { target, value } => {
-                if let ast::ExprKind::SourceRef { name, .. } = &target.node {
-                    let schema = self.source_schemas.get(name).cloned().unwrap_or_default();
-
-                    // Single-value source (`Person *owner`, `Int 1 *counter`):
-                    // wrap the bare value as a one-row `[{_value: val}]` relation
-                    // and write it. (`scalar_sources` are the scalar subset;
-                    // single-value covers records and ADTs too.)
-                    if self.scalar_sources.contains(name) || self.single_value_sources.contains(name) {
-                        let val = self.compile_set_value_expr(builder, value, env, db);
-                        // Validate refinements on the raw value (wrap as [val] for the check)
-                        if self.source_refinements.contains_key(name) {
-                            let singleton =
-                                self.call_rt(builder, "knot_relation_singleton", &[val]);
-                            self.emit_refinement_checks(builder, name, singleton, env, db);
-                        }
-                        let wrapped = self.call_rt(builder, "knot_scalar_source_wrap", &[val]);
-                        let (name_ptr, name_len) = self.string_ptr(builder, name);
-                        let (schema_ptr, schema_len) = self.string_ptr(builder, &schema);
-                        self.call_rt_void(
-                            builder,
-                            "knot_source_write",
-                            &[db, name_ptr, name_len, schema_ptr, schema_len, wrapped],
-                        );
-                        return self.call_rt(builder, "knot_value_unit", &[]);
-                    }
-
-                    let val = self.compile_set_value_expr(builder, value, env, db);
-                    self.emit_refinement_checks(builder, name, val, env, db);
-                    let (name_ptr, name_len) = self.string_ptr(builder, name);
-                    let (schema_ptr, schema_len) = self.string_ptr(builder, &schema);
-                    self.call_rt_void(
-                        builder,
-                        "knot_source_write",
-                        &[db, name_ptr, name_len, schema_ptr, schema_len, val],
-                    );
-                    self.call_rt(builder, "knot_value_unit", &[])
-                } else {
-                    self.push_codegen_error(
-                        builder,
-                        target.span,
-                        "codegen: replace target must be a source reference",
-                    )
-                }
-            }
-
-            ast::ExprKind::Atomic(inner) => {
+ast::ExprKind::Atomic(inner) => {
                 let is_nested = self.atomic_retry_block.is_some();
                 // Whether the body might issue a SQL write (Set/FullSet,
                 // direct or via a user fn). If not, the SAVEPOINT can be
@@ -6414,7 +6368,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
         };
         match &expr.node {
             ast::ExprKind::NameOf(_) => false,
-            Set { target, value } | FullSet { target, value } => {
+            Set { target, value } => {
                 let target_ok = match &target.node {
                     SourceRef { name, .. } => {
                         out.push(name.clone());
@@ -10306,7 +10260,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
             // Only writes (`set`/`full =`) and `atomic` are effects. `full`
             // is a viewer-only tag with no semantic effect.
             ast::ExprKind::SourceRef { .. } => false,
-            ast::ExprKind::Set { .. } | ast::ExprKind::FullSet { .. } => true,
+            ast::ExprKind::Set { .. } => true,
             ast::ExprKind::Atomic(_) => true,
             ast::ExprKind::App { func, arg } => {
                 Self::expr_contains_io(func, builtins, io_fns)
@@ -10515,7 +10469,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
             }
         };
         match &expr.node {
-            ast::ExprKind::Set { .. } | ast::ExprKind::FullSet { .. } => true,
+            ast::ExprKind::Set { .. } => true,
             ast::ExprKind::Atomic(inner) => {
                 Self::expr_contains_writes(inner, write_fns, known_fns, passthrough_fns)
             }
@@ -10669,7 +10623,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
             // A query over a source/derived is a pure, lazy `[T]` — NOT IO.
             // `full` is a viewer-only tag with no semantic effect.
             ast::ExprKind::SourceRef { .. } => false,
-            ast::ExprKind::Set { .. } | ast::ExprKind::FullSet { .. } => true,
+            ast::ExprKind::Set { .. } => true,
             ast::ExprKind::Atomic(_) => true,
             ast::ExprKind::BinOp { lhs, rhs, .. } => {
                 self.expr_is_io_scoped(lhs, scopes) || self.expr_is_io_scoped(rhs, scopes)
@@ -10810,7 +10764,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
             // as the relation value itself.
             ast::ExprKind::SourceRef { .. } => false,
             // Writes and atomic blocks must not run at `let` time.
-            ast::ExprKind::Set { .. } | ast::ExprKind::FullSet { .. } => true,
+            ast::ExprKind::Set { .. } => true,
             ast::ExprKind::Atomic(_) => true,
             ast::ExprKind::BinOp { lhs, rhs, .. } => {
                 self.expr_has_external_io(lhs) || self.expr_has_external_io(rhs)
@@ -11050,7 +11004,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
         let is_io_computation = matches!(
             &expr.node,
             ast::ExprKind::Set { .. }
-                | ast::ExprKind::FullSet { .. }
                 | ast::ExprKind::Atomic(_)
                 | ast::ExprKind::Do(_)
                 | ast::ExprKind::Case { .. }
@@ -12247,7 +12200,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
                                 | ast::ExprKind::List(_)
                                 | ast::ExprKind::Do(_)
                                 | ast::ExprKind::Set { .. }
-                                | ast::ExprKind::FullSet { .. }
                         ) || self.expr_is_known_relation(expr);
                         if is_known_relation {
                             val
@@ -12699,7 +12651,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         self.call_rt_void(builder, "knot_relation_push", &[result, val]);
                     } else if matches!(
                         &expr.node,
-                        ast::ExprKind::Set { .. } | ast::ExprKind::FullSet { .. }
+                        ast::ExprKind::Set { .. }
                     ) {
                         // Compile set inside do block
                         let _ = self.compile_expr(builder, expr, env, db);
@@ -13417,7 +13369,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 ast::StmtKind::GroupBy { key } => Self::references_source(key, source_name),
                 ast::StmtKind::Expr(e) => Self::references_source(e, source_name),
             }),
-            ast::ExprKind::Set { target, value } | ast::ExprKind::FullSet { target, value } => {
+            ast::ExprKind::Set { target, value } => {
                 Self::references_source(target, source_name)
                     || Self::references_source(value, source_name)
             }
@@ -18790,7 +18742,6 @@ fn beta_reduce_inner(
         | Case { .. }
         | Do(_)
         | Set { .. }
-        | FullSet { .. }
         | Atomic(_)
         | TimeUnitLit { .. }
         | Annot { .. }
@@ -18920,7 +18871,7 @@ fn substitute_inner(
         // matchers then compiled the broken AST, panicking with
         // "codegen: undefined variable" or silently capturing a same-named
         // in-scope variable.
-        Case { .. } | Do(_) | Set { .. } | FullSet { .. } | Atomic(_) | Serve { .. } => {
+        Case { .. } | Do(_) | Set { .. } | Atomic(_) | Serve { .. } => {
             if expr_mentions_var(expr, var) {
                 return None;
             }
@@ -18975,7 +18926,7 @@ fn expr_mentions_var(expr: &ast::Expr, var: &str) -> bool {
                 || arms.iter().any(|a| expr_mentions_var(&a.body, var))
         }
         Do(stmts) => in_stmts(stmts),
-        Set { target, value } | FullSet { target, value } => {
+        Set { target, value } => {
             expr_mentions_var(target, var) || expr_mentions_var(value, var)
         }
         Atomic(inner) | Refine(inner) => expr_mentions_var(inner, var),
@@ -19098,7 +19049,7 @@ fn collect_free_vars_set(expr: &ast::Expr, bound: &HashSet<String>, free: &mut H
                 }
             }
         }
-        Set { target, value } | FullSet { target, value } => {
+        Set { target, value } => {
             collect_free_vars_set(target, bound, free);
             collect_free_vars_set(value, bound, free);
         }
@@ -20315,7 +20266,7 @@ fn collect_free_vars(expr: &ast::Expr, bound: &HashSet<&str>, free: &mut Vec<Str
                 }
             }
         }
-        ast::ExprKind::Set { target, value } | ast::ExprKind::FullSet { target, value } => {
+        ast::ExprKind::Set { target, value } => {
             collect_free_vars(target, bound, free);
             collect_free_vars(value, bound, free);
         }
@@ -20454,7 +20405,7 @@ pub(crate) fn expr_refs_var(expr: &ast::Expr, var: &str) -> bool {
             }
             false
         }
-        ast::ExprKind::Set { target, value } | ast::ExprKind::FullSet { target, value } => {
+        ast::ExprKind::Set { target, value } => {
             expr_refs_var(target, var) || expr_refs_var(value, var)
         }
         ast::ExprKind::Atomic(inner) | ast::ExprKind::Refine(inner) => expr_refs_var(inner, var),
@@ -20565,7 +20516,7 @@ fn expr_uses_var_as_value(expr: &ast::Expr, var: &str) -> bool {
             }
             false
         }
-        ast::ExprKind::Set { target, value } | ast::ExprKind::FullSet { target, value } => {
+        ast::ExprKind::Set { target, value } => {
             expr_uses_var_as_value(target, var) || expr_uses_var_as_value(value, var)
         }
         ast::ExprKind::Atomic(inner) | ast::ExprKind::Refine(inner) => {
@@ -20881,10 +20832,7 @@ fn pretty_expr(expr: &ast::Expr) -> String {
         ast::ExprKind::Set { target, value } => {
             format!("{} = {}", pretty_expr(target), pretty_expr(value))
         }
-        ast::ExprKind::FullSet { target, value } => {
-            format!("full {} = {}", pretty_expr(target), pretty_expr(value))
-        }
-        ast::ExprKind::Atomic(e) => format!("atomic ({})", pretty_expr(e)),
+ast::ExprKind::Atomic(e) => format!("atomic ({})", pretty_expr(e)),
         ast::ExprKind::TimeUnitLit { value, .. } => pretty_expr(value),
         ast::ExprKind::Annot { expr, .. } => pretty_expr(expr),
         ast::ExprKind::Refine(inner) => format!("refine {}", pretty_expr(inner)),

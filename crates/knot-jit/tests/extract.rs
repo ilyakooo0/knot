@@ -370,7 +370,7 @@ V1  {name Text  age (Int 1)}
 Rel V1  *people
 }
 (|
-  full *people = [{name "a"  age 30}  {name "b"  age 25}]
+  *people = [{name "a"  age 30}  {name "b"  age 25}]
   rows <- *people
   base.println (base.extract rows)
   yield {})"#,
@@ -389,7 +389,7 @@ Shape  Circle {radius (Float 1)}  Rect {w (Float 1)}
 Rel Shape  *shapes
 }
 (|
-  full *shapes = [(Shape.Circle {radius 1.5})  (Shape.Rect {w 2.0})]
+  *shapes = [(Shape.Circle {radius 1.5})  (Shape.Rect {w 2.0})]
   rows <- *shapes
   base.println (base.extract rows)
   yield {})"#,

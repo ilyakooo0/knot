@@ -14,8 +14,8 @@ Rel {customer Text  amount (Int 1)}  *orders
 *orders.customer <= *people.name
 }
 (|
-  full *people = [{name "Alice"  age 30  email "a@x"}  {name "Bob"  age 25  email "b@x"}]
-  full *orders = [{customer "Alice"  amount 100}]
+  *people = [{name "Alice"  age 30  email "a@x"}  {name "Bob"  age 25  email "b@x"}]
+  *orders = [{customer "Alice"  amount 100}]
   base.println (base.show (base.count *orders))
   yield {})"#,
         // count is a one-element relation now (Rel Int), so it shows as [1].
@@ -36,8 +36,8 @@ Rel {customer Text  amount (Int 1)}  *orders
 *orders.customer <= *people.name
 }
 (|
-  full *people = [{name "Alice"  age 30  email "a@x"}]
-  full *orders = [{customer "Nobody"  amount 100}]
+  *people = [{name "Alice"  age 30  email "a@x"}]
+  *orders = [{customer "Nobody"  amount 100}]
   base.println "wrote"
   yield {})"#,
         dir.path(),
@@ -67,7 +67,7 @@ Rel Person  *people
 *people <= *people.email
 }
 (|
-  full *people = [{name "A"  email "dup@x"}  {name "B"  email "dup@x"}]
+  *people = [{name "A"  email "dup@x"}  {name "B"  email "dup@x"}]
   base.println "wrote"
   yield {})"#,
         dir.path(),

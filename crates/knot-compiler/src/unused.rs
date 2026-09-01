@@ -291,11 +291,7 @@ fn walk_expr(e: &Expr, r: &mut Refs) {
             walk_expr(target, r);
             walk_expr(value, r);
         }
-        ExprKind::FullSet { target, value } => {
-            walk_expr(target, r);
-            walk_expr(value, r);
-        }
-        ExprKind::Atomic(inner) => walk_expr(inner, r),
+ExprKind::Atomic(inner) => walk_expr(inner, r),
         ExprKind::TimeUnitLit { value, .. } => walk_expr(value, r),
         ExprKind::Annot { expr, ty } => {
             walk_expr(expr, r);

@@ -7580,87 +7580,10 @@ impl Infer {
                 let prev_suppress = self.suppress_refine_intro.replace(source_refined);
                 self.check_expr(value, &target_inner);
                 self.suppress_refine_intro = prev_suppress;
-                if let ast::ExprKind::SourceRef { name, .. } = &target.node {
-                    // `set` is a read-modify-write only when the value actually
-                    // reads the source. Relations require that reference (it's
-                    // enforced below), so a valid relation `set` genuinely
-                    // reads. But a scalar `*counter = 5` that references nothing
-                    // reads nothing.
-                    let references = value_references_source(
-                        value,
-                        name,
-                        &self.source_var_binds,
-                        &self.let_bindings,
-                    );
-                    // Require `full *rel = ...` when the value is a full
-                    // replacement (doesn't reference *rel directly or via a
-                    // local alias `xs <- *rel`). Skip views and scalar
-                    // sources where the distinction is meaningless.
-                    let is_view = self.view_names.contains(name);
-                    let is_relation = matches!(self.source_types.get(name), Some(Ty::Relation(_)));
-                    if !is_view && is_relation && !references {
-                        self.error(
-                            format!(
-                                "`*{name} = ...` must reference `*{name}` \
-                                 (directly or via a `<- *{name}` bind); \
-                                 use `full *{name} = ...` for a full replacement"
-                            ),
-                            expr.span,
-                        );
-                    }
-                }
                 Ty::IO(Box::new(Ty::unit()))
             }
 
-            ast::ExprKind::FullSet { target, value } => {
-                let target_ty = self.infer_expr(target);
-                let target_applied = self.apply(&target_ty);
-                let unwrap_io = |ty: &Ty| match ty {
-                    Ty::IO(inner) => (**inner).clone(),
-                    other => other.clone(),
-                };
-                let target_inner = unwrap_io(&target_applied);
-                // See the `Set` arm: writes are runtime-validated, so suppress
-                // the refined-introduction check for this structural unify —
-                // but only for the source's own refinements, not refined
-                // function parameters used inside the value.
-                let source_refined = self.refined_names_in(&target_inner);
-                let prev_suppress = self.suppress_refine_intro.replace(source_refined);
-                self.check_expr(value, &target_inner);
-                self.suppress_refine_intro = prev_suppress;
-                if let ast::ExprKind::SourceRef { name, .. } = &target.node {
-                    // Reject `full *rel = ...` when the value references
-                    // `*rel` (directly, via a `<- *rel` bind, or via a let
-                    // binding that ultimately reads from `*rel`) — `set`
-                    // would produce the same final state more efficiently.
-                    // Skip views and scalar sources where the distinction
-                    // is meaningless.
-                    let is_view = self.view_names.contains(name);
-                    let is_relation = matches!(self.source_types.get(name), Some(Ty::Relation(_)));
-                    if !is_view
-                        && is_relation
-                        && value_references_source(
-                            value,
-                            name,
-                            &self.source_var_binds,
-                            &self.let_bindings,
-                        )
-                    {
-                        self.error(
-                            format!(
-                                "`full *{name} = ...` is unnecessary when \
-                                 the value references `*{name}` \
-                                 (directly or via a `<- *{name}` bind); \
-                                 use `*{name} = ...` instead"
-                            ),
-                            expr.span,
-                        );
-                    }
-                }
-                Ty::IO(Box::new(Ty::unit()))
-            }
-
-            ast::ExprKind::Atomic(inner) => {
+ast::ExprKind::Atomic(inner) => {
                 let prev = self.in_atomic;
                 self.in_atomic = true;
                 let inner_ty = self.infer_expr(inner);
@@ -9592,7 +9515,7 @@ impl Infer {
             // A query over a source/derived is a pure, lazy `[T]` — NOT IO.
             // Only writes (`set`/`full =`) and `atomic` are effects.
             ast::ExprKind::SourceRef { .. } => false,
-            ast::ExprKind::Set { .. } | ast::ExprKind::FullSet { .. } => true,
+            ast::ExprKind::Set { .. } => true,
             ast::ExprKind::Atomic(_) => true,
             ast::ExprKind::BinOp { lhs, rhs, .. } => {
                 self.expr_is_io_prescan(lhs) || self.expr_is_io_prescan(rhs)
@@ -13844,7 +13767,7 @@ fn value_references_source_inner(
                 value_references_source_inner(e, source_name, aliases, let_bindings, visited)
             }
         }),
-        ast::ExprKind::Set { target, value } | ast::ExprKind::FullSet { target, value } => {
+        ast::ExprKind::Set { target, value } => {
             value_references_source_inner(target, source_name, aliases, let_bindings, visited)
                 || value_references_source_inner(value, source_name, aliases, let_bindings, visited)
         }
@@ -15406,7 +15329,7 @@ fn walk_expr_children_mut(expr: &mut ast::Expr, f: &mut impl FnMut(&mut ast::Exp
                 }
             }
         }
-        Set { target, value } | FullSet { target, value } => {
+        Set { target, value } => {
             f(target);
             f(value);
         }
@@ -15481,7 +15404,7 @@ pub(crate) fn subst_var(expr: &mut ast::Expr, var: &str, replacement: &ast::Expr
                 }
             }
         }
-        Set { target, value } | FullSet { target, value } => {
+        Set { target, value } => {
             subst_var(target, var, replacement);
             subst_var(value, var, replacement);
         }
@@ -15573,7 +15496,7 @@ pub(crate) fn walk_exprs_read<'a>(e: &'a ast::Expr, f: &mut impl FnMut(&'a ast::
                 }
             }
         }
-        Set { target, value } | FullSet { target, value } => {
+        Set { target, value } => {
             walk_exprs_read(target, f);
             walk_exprs_read(value, f);
         }
@@ -15721,7 +15644,7 @@ fn for_each_data_ctor_scoped<'a>(
                     }
                 }
             }
-            Set { target, value } | FullSet { target, value } => {
+            Set { target, value } => {
                 walk(target, d, f);
                 walk(value, d, f);
             }

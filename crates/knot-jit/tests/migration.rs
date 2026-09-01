@@ -42,7 +42,7 @@ PersonV1  {name Text}
 Rel PersonV1  *people
 }
 (|
-  full *people = [{name "Alice"}]
+  *people = [{name "Alice"}]
   yield {})"#;
 
 const V2_PENDING: &str = r#"with {
@@ -348,7 +348,7 @@ V1  {name Text}
 Rel V1  *people
 }
 (|
-  full *people = [{name "alice"}  {name "bob"}]
+  *people = [{name "alice"}  {name "bob"}]
   rows <- *people
   base.println (base.show rows)
   yield {})"#;

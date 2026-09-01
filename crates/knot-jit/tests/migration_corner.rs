@@ -68,7 +68,7 @@ V1  {name Text}
 Rel V1  *people
 }
 (|
-  full *people = [{name "a"}  {name "b"}]
+  *people = [{name "a"}  {name "b"}]
   yield {})"#;
     let v2 = r#"with {
 V1  {name Text}
@@ -100,7 +100,7 @@ V1  {name Text  age (Int 1)}
 Rel V1  *people
 }
 (|
-  full *people = [{name "a"  age 5}]
+  *people = [{name "a"  age 5}]
   yield {})"#;
     let v2 = r#"with {
 V1  {name Text  age (Int 1)}
@@ -132,7 +132,7 @@ V1  {name Text}
 Rel V1  *people
 }
 (|
-  full *people = [{name "a"}]
+  *people = [{name "a"}]
   yield {})"#;
     let v2 = r#"with {
 V1  {name Text}
@@ -164,7 +164,7 @@ V1  {a Text  b (Int 1)}
 Rel V1  *r
 }
 (|
-  full *r = [{a "x"  b 1}]
+  *r = [{a "x"  b 1}]
   yield {})"#;
     let v2 = r#"with {
 V1  {a Text  b (Int 1)}
@@ -199,7 +199,7 @@ V1  {name Text  tags (Rel Text)}
 Rel V1  *people
 }
 (|
-  full *people = [{name "a"  tags ["x"  "y"]}]
+  *people = [{name "a"  tags ["x"  "y"]}]
   yield {})"#;
     let v2 = r#"with {
 V1  {name Text  tags (Rel Text)}
@@ -233,7 +233,7 @@ V1  {name Text  pets (Rel Pet)}
 Rel V1  *people
 }
 (|
-  full *people = [{name "a"  pets [{name "pup"  legs 4}]}]
+  *people = [{name "a"  pets [{name "pup"  legs 4}]}]
   yield {})"#;
     let v2 = r#"with {
 Pet  {name Text  legs (Int 1)}
@@ -267,7 +267,7 @@ V1  {name Text  grid (Rel (Rel (Int 1)))}
 Rel V1  *r
 }
 (|
-  full *r = [{name "a"  grid [[1  2]  [3]]}]
+  *r = [{name "a"  grid [[1  2]  [3]]}]
   yield {})"#;
     let v2 = r#"with {
 V1  {name Text  grid (Rel (Rel (Int 1)))}
@@ -300,7 +300,7 @@ V1  {name Text  addr Addr}
 Rel V1  *people
 }
 (|
-  full *people = [{name "a"  addr {city "x"}}]
+  *people = [{name "a"  addr {city "x"}}]
   yield {})"#;
     let v2 = r#"with {
 Addr  {city Text}
@@ -336,7 +336,7 @@ V1  {name Text  addr Addr}
 Rel V1  *people
 }
 (|
-  full *people = [{name "a"  addr {city "x"}}]
+  *people = [{name "a"  addr {city "x"}}]
   yield {})"#;
     let v2 = r#"with {
 Addr  {city Text}
@@ -373,7 +373,7 @@ V1  {name Text  sh Shape}
 Rel V1  *es
 }
 (|
-  full *es = [{name "a"  sh (Shape.Circle {radius 3})}]
+  *es = [{name "a"  sh (Shape.Circle {radius 3})}]
   yield {})"#;
     let v2 = r#"with {
 Shape  Circle {radius (Int 1)}  Point {}
@@ -409,7 +409,7 @@ Ev  Ping {}  Msg {text Text}
 Rel Ev  *evs
 }
 (|
-  full *evs = [(Ev.Ping {})  (Ev.Msg {text "hi"})]
+  *evs = [(Ev.Ping {})  (Ev.Msg {text "hi"})]
   yield {})"#;
     let v2 = r#"with {
 Ev  Ping {}  Msg {text Text}
@@ -476,7 +476,7 @@ V1  {name Text}
 Rel V1  *people
 }
 (|
-  full *people = [{name "a"}  {name "b"}  {name "c"}  {name "d"}]
+  *people = [{name "a"}  {name "b"}  {name "c"}  {name "d"}]
   yield {})"#;
     let v2 = r#"with {
 V1  {name Text}
@@ -511,7 +511,7 @@ V1  {name Text}
 Rel V1  *r
 }
 (|
-  full *r = [{name "x"}]
+  *r = [{name "x"}]
   yield {})"#;
     let v2 = r#"with {
 V1  {name Text}
@@ -567,7 +567,7 @@ V1  {name Text}
 Rel V1  *people
 }
 (|
-  full *people = [{name "a"}]
+  *people = [{name "a"}]
   yield {})"#;
     let v2 = r#"with {
 V1  {name Text}
@@ -600,7 +600,7 @@ V1  {name Text  tags (Rel Text)}
 Rel V1  *people
 }
 (|
-  full *people = [{name "a"  tags ["x"]}]
+  *people = [{name "a"  tags ["x"]}]
   yield {})"#;
     let v2 = r#"with {
 V1  {name Text  tags (Rel Text)}
@@ -633,7 +633,7 @@ V1  {name Text  tags (Rel Text)}
 Rel V1  *people
 }
 (|
-  full *people = [{name "a"  tags ["x"]}]
+  *people = [{name "a"  tags ["x"]}]
   yield {})"#;
     let v2 = r#"with {
 V1  {name Text  tags (Rel Text)}
@@ -669,8 +669,8 @@ W  {id (Int 1)}
 Rel W  *widgets
 }
 (|
-  full *people = [{name "a"}]
-  full *widgets = [{id 1}]
+  *people = [{name "a"}]
+  *widgets = [{id 1}]
   yield {})"#;
     let v2 = r#"with {
 V1  {name Text}
@@ -711,8 +711,8 @@ W  {id (Int 1)}
 Rel W  *widgets
 }
 (|
-  full *people = [{name "a"}]
-  full *widgets = [{id 1}]
+  *people = [{name "a"}]
+  *widgets = [{id 1}]
   yield {})"#;
     let v2 = r#"with {
 V1  {name Text}
@@ -744,7 +744,7 @@ V1  {name Text  col Color}
 Rel V1  *es
 }
 (|
-  full *es = [{name "a"  col (Color.Red {})}]
+  *es = [{name "a"  col (Color.Red {})}]
   yield {})"#;
     let v2 = r#"with {
 Color  Red {}  Green {}
@@ -778,7 +778,7 @@ V1  {name Text}
 Rel V1  *people
 }
 (|
-  full *people = [{name "a"}]
+  *people = [{name "a"}]
   yield {})"#;
     let v2 = r#"with {
 V1  {name Text}
@@ -810,7 +810,7 @@ V1  {n (Int 1)}
 Rel V1  *r
 }
 (|
-  full *r = [{n 5}]
+  *r = [{n 5}]
   yield {})"#;
     let v2 = r#"with {
 Shape  Circle {radius (Int 1)}  Point {}
@@ -848,7 +848,7 @@ Rel V1  *people
 *people <= *people.name
 }
 (|
-  full *people = [{name "a"}]
+  *people = [{name "a"}]
   yield {})"#;
     let v2 = r#"with {
 V1  {name Text}
@@ -885,7 +885,7 @@ V1  {name Text}
 Rel V1  *people
 }
 (|
-  full *people = [{name "a"}]
+  *people = [{name "a"}]
   yield {})"#;
     let v2 = r#"with {
 V1  {name Text}
@@ -936,7 +936,7 @@ V1  {name Text}
 Rel V1  *people
 }
 (|
-  full *people = [{name "a"}]
+  *people = [{name "a"}]
   yield {})"#;
     build_and_run(&dir, "mig_noop", v1);
     lock_in_dir(dir.path(), "mig_noop");
@@ -980,7 +980,7 @@ V1  {name Text  nick (Maybe Text)}
 Rel V1  *people
 }
 (|
-  full *people = [{name "a"  nick (Maybe.Just {value "al"})}  {name "b"  nick (Maybe.Nothing {})}]
+  *people = [{name "a"  nick (Maybe.Just {value "al"})}  {name "b"  nick (Maybe.Nothing {})}]
   yield {})"#;
     let v2 = r#"with {
 V1  {name Text  nick (Maybe Text)}
@@ -1015,7 +1015,7 @@ V1  {name Text  score (Float 1)}
 Rel V1  *r
 }
 (|
-  full *r = [{name "a"  score 1.5}]
+  *r = [{name "a"  score 1.5}]
   yield {})"#;
     let v2 = r#"with {
 V1  {name Text  score (Float 1)}
@@ -1052,7 +1052,7 @@ V1  {name Text  inner Inner}
 Rel V1  *r
 }
 (|
-  full *r = [{name "a"  inner {shapes [(Shape.Point {})]}}]
+  *r = [{name "a"  inner {shapes [(Shape.Point {})]}}]
   yield {})"#;
     let v2 = r#"with {
 Shape  Circle {radius (Int 1)}  Point {}
@@ -1091,7 +1091,7 @@ V1  {name Text  addr Addr}
 Rel V1  *people
 }
 (|
-  full *people = [{name "a"  addr {city "x"  zip 100}}]
+  *people = [{name "a"  addr {city "x"  zip 100}}]
   yield {})"#;
     let v2 = r#"with {
 Addr  {city Text  zip (Int 1)}
@@ -1125,7 +1125,7 @@ V1  {old Text}
 Rel V1  *r
 }
 (|
-  full *r = [{old "x"}]
+  *r = [{old "x"}]
   yield {})"#;
     let v2 = r#"with {
 V1  {old Text}
@@ -1164,8 +1164,8 @@ Rel V1  *pets
 *pets.email <= *owners.email
 }
 (|
-  full *owners = [{email "a@x"}]
-  full *pets = [{email "a@x"}]
+  *owners = [{email "a@x"}]
+  *pets = [{email "a@x"}]
   yield {})"#;
     let v2 = r#"with {
 Owner  {email Text}
@@ -1207,8 +1207,8 @@ Rel V1  *pets
 *pets.email <= *owners.email
 }
 (|
-  full *owners = [{email "a@x"}]
-  full *pets = [{email "a@x"}]
+  *owners = [{email "a@x"}]
+  *pets = [{email "a@x"}]
   yield {})"#;
     let v2 = r#"with {
 Owner  {email Text}
@@ -1269,7 +1269,7 @@ V1  {name Text}
 Rel V1  *people
 }
 (|
-  full *people = [{name "a"}]
+  *people = [{name "a"}]
   yield {})"#;
     let v2 = r#"with {
 V1  {name Text}
@@ -1302,7 +1302,7 @@ V1  {name (Maybe Text)}
 Rel V1  *people
 }
 (|
-  full *people = [{name (Maybe.Just {value "a"})}  {name (Maybe.Nothing {})}]
+  *people = [{name (Maybe.Just {value "a"})}  {name (Maybe.Nothing {})}]
   yield {})"#;
     let v2 = r#"with {
 V1  {name (Maybe Text)}
@@ -1338,7 +1338,7 @@ V1  {age (Int 1)}
 Rel V1  *r
 }
 (|
-  full *r = [{age 5}]
+  *r = [{age 5}]
   yield {})"#;
     let v2 = r#"with {
 V1  {age (Int 1)}
@@ -1371,7 +1371,7 @@ V1  {n (Int 1)}
 Rel V1  *r
 }
 (|
-  full *r = [{n 7}]
+  *r = [{n 7}]
   yield {})"#;
     let v2 = r#"with {
 V1  {n (Int 1)}
@@ -1405,7 +1405,7 @@ Ev  Ping {}  Msg {text Text}
 Rel Ev  *evs
 }
 (|
-  full *evs = [(Ev.Ping {})  (Ev.Msg {text "hi"})]
+  *evs = [(Ev.Ping {})  (Ev.Msg {text "hi"})]
   yield {})"#;
     let v2 = r#"with {
 Ev  Ping {}  Msg {text Text}

@@ -622,7 +622,6 @@ impl Parser {
                 Ok((n, tok.span))
             }
             TokenKind::Where
-            | TokenKind::Full
             | TokenKind::Atomic
             | TokenKind::With
             | TokenKind::Refine
@@ -1402,53 +1401,6 @@ impl Parser {
                     Some(target)
                 }
             }
-            TokenKind::Full => {
-                // `full *rel = expr` is a replace-set expression. So is
-                // `full db.*rel = expr` (a source-field on a record-var:
-                // `Lower` `.` `StarIdent`). `full` only marks a WRITE; a bare
-                // `*rel` read needs no marker. Otherwise `full` is a regular
-                // identifier.
-                let mut offset = 1;
-                while self.peek_ahead(offset) == &TokenKind::Newline {
-                    offset += 1;
-                }
-                let next = self.peek_ahead(offset);
-                // `db.*rel` — a record-var target whose field is a source.
-                let is_record_source_target = matches!(next, TokenKind::Lower(_))
-                    && self.peek_ahead(offset + 1) == &TokenKind::Dot
-                    && matches!(self.peek_ahead(offset + 2), TokenKind::StarIdent(_));
-                if is_record_source_target {
-                    let replace_start = self.span();
-                    self.advance(); // consume `full`
-                    self.skip_newlines();
-                    self.parse_set_with_start(true, replace_start)
-                } else if next == &TokenKind::Star || matches!(next, TokenKind::StarIdent(_)) {
-                    // `full` before a source marks a write (`full *rel = expr`).
-                    // A read is a bare `*rel` with no `full`.
-                    let past = if matches!(next, TokenKind::StarIdent(_)) {
-                        offset + 1 // `*rel` is one token
-                    } else {
-                        offset + 2 // `*` then `rel`
-                    };
-                    let after = self.peek_ahead(past);
-                    if after == &TokenKind::Eq {
-                        // Write: `full *rel = expr`.
-                        let replace_start = self.span();
-                        self.advance(); // consume `full`
-                        self.skip_newlines();
-                        self.parse_set_with_start(true, replace_start)
-                    } else {
-                        self.error(
-                            "`full` only marks a write (`full *rel = ...`); a read is just `*rel`",
-                        );
-                        None
-                    }
-                } else {
-                    // `full` used as a regular identifier — fall through to
-                    // Pratt parsing so binary operators and application work.
-                    self.parse_expr_bp(0)
-                }
-            }
             TokenKind::Atomic => {
                 if !self.enter_recursion() {
                     return None;
@@ -1817,7 +1769,6 @@ impl Parser {
             | TokenKind::LParen
             | TokenKind::LBrace
             | TokenKind::LBracket
-            | TokenKind::Full
             | TokenKind::Pipe => true,
             // `yield` is not a keyword but should not start application atoms
             // (like keywords), to prevent `f; yield x` from parsing as `f yield x`
@@ -2128,13 +2079,6 @@ impl Parser {
                     unreachable!()
                 };
                 Some(Spanned::new(ExprKind::Constructor(name), tok.span))
-            }
-            TokenKind::Full => {
-                let tok = self.advance();
-                Some(Spanned::new(
-                    ExprKind::Var(Binding::User("full".into())),
-                    tok.span,
-                ))
             }
             TokenKind::StarIdent(_) => {
                 // `*name` lexed as a single token — source reference.
@@ -3254,41 +3198,6 @@ impl Parser {
         })
     }
 
-    fn parse_set_with_start(&mut self, replace: bool, start: Span) -> Option<Expr> {
-        let ctx = if replace {
-            "replace set expression"
-        } else {
-            "set expression"
-        };
-        self.in_context(ctx, |this| {
-            // The caller has already positioned the parser at the target. A
-            // set/replace target is a field-access chain (`*rel`, `x`,
-            // `rec.field`, or `db.*rel` on a source-record) — never an
-            // application or binary op — so parse it with `parse_postfix`,
-            // which handles the `.`-chain including the `*name` source-field
-            // form. (`parse_expr_bp` would stop at `db` and leave `.*todos`
-            // dangling.)
-            let target = this.parse_postfix()?;
-
-            this.expect(&TokenKind::Eq, "expected '=' after target")
-                .ok()?;
-            let value = this.parse_expr()?;
-
-            let end_sp = value.span;
-            let kind = if replace {
-                ExprKind::FullSet {
-                    target: Box::new(target),
-                    value: Box::new(value),
-                }
-            } else {
-                ExprKind::Set {
-                    target: Box::new(target),
-                    value: Box::new(value),
-                }
-            };
-            Some(Spanned::new(kind, Span::new(start.start, end_sp.end)))
-        })
-    }
 
     /// `with record body` — `record` is an atom (record literal, variable, or
     /// parenthesized expression, optionally with field-access chains); `body`

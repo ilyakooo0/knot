@@ -485,7 +485,7 @@ impl<'a> DefResolver<'a> {
             }
             ast::ExprKind::UnaryOp { operand, .. } => self.resolve_expr(operand),
             ast::ExprKind::Atomic(e) => self.resolve_expr(e),
-            ast::ExprKind::Set { target, value } | ast::ExprKind::FullSet { target, value } => {
+            ast::ExprKind::Set { target, value } => {
                 self.resolve_expr(target);
                 self.resolve_expr(value);
             }

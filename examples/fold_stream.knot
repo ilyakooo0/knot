@@ -4,7 +4,7 @@ Sale  {item Text  qty (Int 1)  price (Int 1)}
 Rel Sale  *sales
 }
 (|
-  full *sales = [
+  *sales = [
     {  item "apple"  qty 3  price 50 } 
     {  item "banana"  qty 7  price 20 } 
     {  item "cherry"  qty 2  price 120 } 

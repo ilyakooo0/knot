@@ -22,7 +22,6 @@ pub enum TokenKind {
     // Keywords
     Where,
     Not,
-    Full,
     Atomic,
     With,
     Refine,
@@ -103,7 +102,6 @@ impl TokenKind {
             TokenKind::Upper(_) => "type name",
             TokenKind::Where => "'where'",
             TokenKind::Not => "'not'",
-            TokenKind::Full => "'full'",
             TokenKind::Atomic => "'atomic'",
             TokenKind::With => "'with'",
             TokenKind::Refine => "'refine'",
@@ -158,7 +156,6 @@ impl TokenKind {
         match self {
             TokenKind::Where => Some("where"),
             TokenKind::Not => Some("not"),
-            TokenKind::Full => Some("full"),
             TokenKind::Atomic => Some("atomic"),
             TokenKind::With => Some("with"),
             TokenKind::Refine => Some("refine"),
@@ -545,7 +542,6 @@ impl<'src> Lexer<'src> {
         if first.is_ascii_lowercase() || first == b'_' {
             match text {
                 "where" => return TokenKind::Where,
-                "full" => return TokenKind::Full,
                 "atomic" => return TokenKind::Atomic,
                 "with" => return TokenKind::With,
                 "refine" => return TokenKind::Refine,

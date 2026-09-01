@@ -78,9 +78,9 @@ C  {n (Int 1)}
 Rel C  *cs
 }
 (|
-  full *cs = [{n 1}]
+  *cs = [{n 1}]
   base.fork (atomic |
-    full *cs = [{n 2}]
+    *cs = [{n 2}]
     base.println (base.show (9223372036854775807 + 1))
     yield {})
   base.sleep 300

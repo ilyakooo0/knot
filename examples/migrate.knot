@@ -29,6 +29,6 @@ Rel Person  *people
 
 }
 (|
-  full *people = [{name "Alice"  active (Active.Yes {})}  {name "Bob"  active (Active.No {})}]
+  *people = [{name "Alice"  active (Active.Yes {})}  {name "Bob"  active (Active.No {})}]
   rows <- *people
   base.println (base.show rows))

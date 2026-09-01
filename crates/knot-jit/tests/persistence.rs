@@ -14,7 +14,7 @@ Todo  {owner Text  done (Int 1)}
 Rel Todo  *todos
 }
 (|
-  full *todos = [{owner "x"  done 0}  {owner "x"  done 1}  {owner "y"  done 0}]
+  *todos = [{owner "x"  done 0}  {owner "x"  done 1}  {owner "y"  done 0}]
   groups <- (|
     t <- *todos
     where t.done == 0
@@ -37,7 +37,7 @@ C  {n (Int 1)}
 Rel C  *cs
 }
 (|
-  full *cs = [{n 1}  {n 2}  {n 3}]
+  *cs = [{n 1}  {n 2}  {n 3}]
   rows <- *cs
   base.println (base.show (base.count rows))
   base.println (base.show (base.sum (base.map (\c -> c.n) rows)))
@@ -135,7 +135,7 @@ Account  {name Text  balance (Int 1)}
 Rel Account  *accounts
 }
 (|
-  full *accounts = [{name "from"  balance 100}  {name "to"  balance 0}]
+  *accounts = [{name "from"  balance 100}  {name "to"  balance 0}]
   _ <- atomic |
     rows <- *accounts
     *accounts = base.map (\a ->
@@ -165,7 +165,7 @@ Shape  Circle {radius (Int 1)}  Square {side (Int 1)}  Point {}
 Rel Shape  *shapes
 }
 (|
-  full *shapes = [Shape.Circle {radius 3}  Shape.Square {side 2}  Shape.Point {}]
+  *shapes = [Shape.Circle {radius 3}  Shape.Square {side 2}  Shape.Point {}]
   rows <- *shapes
   base.println (base.show rows)
   yield {})"#,
@@ -191,7 +191,7 @@ Entry  {name Text  sh Shape}
 Rel Entry  *es
 }
 (|
-  full *es = [{name "a"  sh (Shape.Circle {radius 3})}  {name "b"  sh (Shape.Point {})}]
+  *es = [{name "a"  sh (Shape.Circle {radius 3})}  {name "b"  sh (Shape.Point {})}]
   rows <- *es
   base.println (base.show rows)
   yield {})"#,
@@ -213,7 +213,7 @@ Entry  {name Text  sh Shape}
 Rel Entry  *es
 }
 (|
-  full *es = [{name "a"  sh (Shape.Circle {radius 3})}  {name "b"  sh (Shape.Circle {radius 3})}  {name "c"  sh (Shape.Point {})}]
+  *es = [{name "a"  sh (Shape.Circle {radius 3})}  {name "b"  sh (Shape.Circle {radius 3})}  {name "c"  sh (Shape.Point {})}]
   yield {})"#,
         dir.path(),
     );
@@ -251,7 +251,7 @@ Entry  {name Text  addr {city Text  zip (Int 1)}}
 Rel Entry  *es
 }
 (|
-  full *es = [{name "a"  addr {city "paris"  zip 75001}}]
+  *es = [{name "a"  addr {city "paris"  zip 75001}}]
   yield {})"#,
         dir.path(),
     );
@@ -288,7 +288,7 @@ Entry  {name Text  tags (Rel Text)}
 Rel Entry  *es
 }
 (|
-  full *es = [{name "a"  tags ["x"  "y"]}  {name "b"  tags ["y"  "z"]}]
+  *es = [{name "a"  tags ["x"  "y"]}  {name "b"  tags ["y"  "z"]}]
   yield {})"#,
         dir.path(),
     );
@@ -335,7 +335,7 @@ Entry  {name Text  sh Shape}
 Rel Entry  *es
 }
 (|
-  full *es = [{name "a"  sh (Shape.Circle {tags [{value "x"}  {value "y"}]  radius 5})}]
+  *es = [{name "a"  sh (Shape.Circle {tags [{value "x"}  {value "y"}]  radius 5})}]
   rows <- *es
   base.println (base.show rows)
   yield {})"#,
@@ -354,7 +354,7 @@ Entry  {name Text  sh Shape}
 Rel Entry  *es
 }
 (|
-  full *es = [{name "a"  sh (Shape.Circle {tags [{value "x"}]  radius 5})}]
+  *es = [{name "a"  sh (Shape.Circle {tags [{value "x"}]  radius 5})}]
   yield {})"#,
         dir.path(),
     );
@@ -395,7 +395,7 @@ Entry  {name Text  grid (Rel (Rel (Int 1)))}
 Rel Entry  *es
 }
 (|
-  full *es = [{name "a"  grid [[1  2]  [3]]}]
+  *es = [{name "a"  grid [[1  2]  [3]]}]
   rows <- *es
   base.println (base.show rows)
   yield {})"#,
@@ -417,7 +417,7 @@ Entry  {name Text  sh Shape}
 Rel Entry  *es
 }
 (|
-  full *es = [{name "a"  sh (Shape.Circle {radius 3})}]
+  *es = [{name "a"  sh (Shape.Circle {radius 3})}]
   yield {})"#,
         dir.path(),
     );
@@ -455,8 +455,8 @@ Entry  {name Text  sh Shape}
 Rel Entry  *es
 }
 (|
-  full *es = [{name "a"  sh (Shape.Circle {radius 3})}]
-  full *es = [{name "b"  sh (Shape.Point {})}]
+  *es = [{name "a"  sh (Shape.Circle {radius 3})}]
+  *es = [{name "b"  sh (Shape.Point {})}]
   yield {})"#,
         dir.path(),
     );
@@ -492,7 +492,7 @@ C  {n (Int 1)}
 Rel C  *cs
 }
 (|
-  full *cs = [{n 42}]
+  *cs = [{n 42}]
   yield {})"#,
         dir.path(),
     );
@@ -518,7 +518,7 @@ Rel C  *cs
 
 /// A function value can't be persisted. A source whose element type contains a
 /// function field must be a **compile error**, not a runtime crash: the schema
-/// catch-all used to type it `fn:text`, then `full *rs = [{f (\n -> n)}]`
+/// catch-all used to type it `fn:text`, then `*rs = [{f (\n -> n)}]`
 /// aborted the process with `cannot convert Function to SQL`. Nested functions
 /// (inside a record/variant payload) must also be rejected — they used to
 /// serialize to a dead display string that crashed on call.
@@ -531,7 +531,7 @@ R  {name Text  f (Int 1 -> Int 1)}
 Rel R  *rs
 }
 (|
-  full *rs = [{name "x"  f (\n -> n + 1)}]
+  *rs = [{name "x"  f (\n -> n + 1)}]
   yield {})"#;
     let src_path = dir.join("fnfield.knot");
     std::fs::write(&src_path, src).unwrap();
@@ -566,7 +566,7 @@ R  {name Text  f S}
 Rel R  *rs
 }
 (|
-  full *rs = [{name "x"  f (S.Wrap {g (\n -> n)})}]
+  *rs = [{name "x"  f (S.Wrap {g (\n -> n)})}]
   yield {})"#;
     let src_path = dir.join("fnadt.knot");
     std::fs::write(&src_path, src).unwrap();
@@ -604,7 +604,7 @@ E  {n (Int 1)}
 Rel E  *emps
 }
 (|
-  full *emps = [{n 9223372036854775807}  {n 1}]
+  *emps = [{n 9223372036854775807}  {n 1}]
   base.println (base.show (*emps |> base.map (\e -> e.n) |> base.sum))
   yield {})"#,
         dir.path(),

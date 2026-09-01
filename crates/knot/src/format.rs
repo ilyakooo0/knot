@@ -592,7 +592,7 @@ fn forces_multiline(e: &Expr) -> bool {
         ExprKind::Do(_) | ExprKind::Case { .. } => true,
         ExprKind::Lambda { body, .. } => forces_multiline(body),
         ExprKind::App { func, arg } => forces_multiline(func) || forces_multiline(arg),
-        ExprKind::Set { value, .. } | ExprKind::FullSet { value, .. } => forces_multiline(value),
+        ExprKind::Set { value, .. } => forces_multiline(value),
         // A record carrying an embedded declaration — a type-first sig
         // (`Type  name`), a source decl (`Rel T  *name`), or a `type`/`data`
         // alias — must render as a block: inline, the declaration merges with
@@ -780,14 +780,6 @@ fn render_expr_inline(e: &Expr, parent: Prec) -> String {
             // argument, operand, ...), like other lowest-precedence forms.
             let s = format!(
                 "{} = {}",
-                render_expr_inline(target, Prec::App),
-                render_expr_inline(value, Prec::Lowest)
-            );
-            paren_if(parent > Prec::Lowest, s)
-        }
-        ExprKind::FullSet { target, value } => {
-            let s = format!(
-                "full {} = {}",
                 render_expr_inline(target, Prec::App),
                 render_expr_inline(value, Prec::Lowest)
             );
@@ -1044,8 +1036,7 @@ fn annot_inner_needs_parens(e: &Expr, inline: bool) -> bool {
         ExprKind::Lambda { .. }
         | ExprKind::Atomic(_)
         | ExprKind::Refine(_)
-        | ExprKind::Set { .. }
-        | ExprKind::FullSet { .. } => true,
+        | ExprKind::Set { .. } => true,
         // Last case arm body / do statement / serve handler is also parsed
         // with `parse_expr`, but the inline renderers already wrap these in
         // parens unconditionally.
@@ -1122,19 +1113,6 @@ fn render_expr_block(p: &mut Printer, e: &Expr, parent: Prec) {
             if need_parens {
                 p.write("(");
             }
-            render_expr(p, target, Prec::App);
-            p.write(" = ");
-            render_expr(p, value, Prec::Lowest);
-            if need_parens {
-                p.write(")");
-            }
-        }
-        ExprKind::FullSet { target, value } => {
-            let need_parens = parent > Prec::Lowest;
-            if need_parens {
-                p.write("(");
-            }
-            p.write("full ");
             render_expr(p, target, Prec::App);
             p.write(" = ");
             render_expr(p, value, Prec::Lowest);

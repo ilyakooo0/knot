@@ -167,7 +167,7 @@ fn walk_expr_children_read(expr: &Expr, f: &mut impl FnMut(&Expr)) {
                 }
             }
         }
-        ExprKind::Set { target, value } | ExprKind::FullSet { target, value } => {
+        ExprKind::Set { target, value } => {
             f(target);
             f(value);
         }
@@ -310,7 +310,7 @@ fn collect_fun_bodies<'a>(
                 }
             }
         }
-        ExprKind::Set { target, value } | ExprKind::FullSet { target, value } => {
+        ExprKind::Set { target, value } => {
             collect_fun_bodies(target, fun_bodies, fun_sig_io);
             collect_fun_bodies(value, fun_bodies, fun_sig_io);
         }
@@ -404,7 +404,7 @@ fn expr_contains_io(expr: &Expr, builtins: &HashSet<&str>, io_fns: &HashSet<Stri
     match &expr.node {
         ExprKind::Var(name) => builtins.contains(name.as_str()) || io_fns.contains(name.as_str()),
         ExprKind::SourceRef { .. } => true,
-        ExprKind::Set { .. } | ExprKind::FullSet { .. } => true,
+        ExprKind::Set { .. } => true,
         ExprKind::Atomic(_) => true,
         ExprKind::TimeUnitLit { value, .. } => expr_contains_io(value, builtins, io_fns),
         ExprKind::Annot { expr, .. } => expr_contains_io(expr, builtins, io_fns),
@@ -630,7 +630,7 @@ fn walk_expr_children(expr: &mut Expr, f: &mut impl FnMut(&mut Expr)) {
                 }
             }
         }
-        ExprKind::Set { target, value } | ExprKind::FullSet { target, value } => {
+        ExprKind::Set { target, value } => {
             f(target);
             f(value);
         }
@@ -658,7 +658,7 @@ fn desugar_expr(expr: &mut Expr, io_fns: &IoFns, source_vars: &HashSet<String>) 
     // First, recurse into sub-expressions (bottom-up).
     // We handle Set/FullSet specially to avoid desugaring their value do blocks.
     match &mut expr.node {
-        ExprKind::Set { target, value } | ExprKind::FullSet { target, value } => {
+        ExprKind::Set { target, value } => {
             desugar_expr(target, io_fns, source_vars);
             // Don't desugar the top-level do block of a set value,
             // but DO recurse into its sub-expressions.
@@ -791,7 +791,7 @@ fn recurse_into_children(expr: &mut Expr, io_fns: &IoFns, source_vars: &HashSet<
         ExprKind::Do(stmts) => {
             desugar_do_stmts(stmts, io_fns, source_vars);
         }
-        ExprKind::Set { target, value } | ExprKind::FullSet { target, value } => {
+        ExprKind::Set { target, value } => {
             desugar_expr(target, io_fns, source_vars);
             desugar_expr(value, io_fns, source_vars);
         }
@@ -1201,7 +1201,7 @@ fn expr_is_io(expr: &Expr, io_fns: &HashSet<String>) -> bool {
                 || io_fns.contains(name.as_str())
         }
         ExprKind::SourceRef { .. } => true,
-        ExprKind::Set { .. } | ExprKind::FullSet { .. } => true,
+        ExprKind::Set { .. } => true,
         ExprKind::Atomic(_) => true,
         ExprKind::BinOp { lhs, rhs, .. } => expr_is_io(lhs, io_fns) || expr_is_io(rhs, io_fns),
         ExprKind::UnaryOp { operand, .. } => expr_is_io(operand, io_fns),

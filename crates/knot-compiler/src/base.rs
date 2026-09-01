@@ -396,7 +396,7 @@ fn shift_expr_spans(e: &mut ast::Expr, offset: usize) {
                 shift_stmt_spans(s, offset);
             }
         }
-        Set { target, value } | FullSet { target, value } => {
+        Set { target, value } => {
             shift_expr_spans(target, offset);
             shift_expr_spans(value, offset);
         }

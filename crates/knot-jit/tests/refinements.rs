@@ -89,7 +89,7 @@ Nat  Int 1 \x ->  x >= 0
 Rel {name Text  age Nat}  *people
 }
 (|
-  full *people = [{name "a"  age (0 - 5)}]
+  *people = [{name "a"  age (0 - 5)}]
   base.println "wrote"
   yield {})"#,
         dir.path(),
@@ -116,7 +116,7 @@ Nat  Int 1 \x ->  x >= 0
 Rel {name Text  age Nat}  *people
 }
 (|
-  full *people = [{name "a"  age 30}]
+  *people = [{name "a"  age 30}]
   base.println (base.show (base.count *people))
   yield {})"#,
         // count is a one-element relation now (Rel Int), so it shows as [1].

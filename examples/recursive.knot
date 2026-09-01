@@ -8,7 +8,7 @@ directReports (|
   yield {manager m.manager  report m.report})
 }
 (|
-  full *manages = [
+  *manages = [
     {manager "Alice"  report "Bob"}
     {manager "Alice"  report "Carol"}
     {manager "Bob"  report "Dave"}

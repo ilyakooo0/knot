@@ -52,7 +52,7 @@ Rel Metric  *metrics
 -- ── Seed  data ────────────────────────────────────────────────────
 
 seedEmployees (|
-  full *employees = [
+  *employees = [
     {name "Alice Chen"  age 34  salary 142000.0  dept (Department.Engineering {})  active (Active.Yes {})} 
     {name "Bob Martinez"  age 28  salary 95000.0  dept (Department.Engineering {})  active (Active.Yes {})} 
     {name "Carol Davis"  age 41  salary 155000.0  dept (Department.Engineering {})  active (Active.Yes {})} 
@@ -77,7 +77,7 @@ seedEmployees (|
   yield {})
 
 seedProjects (|
-  full *projects = [
+  *projects = [
     {name "Phoenix"  lead "Alice Chen"  budget 500000.0  priority (Priority.Critical {})} 
     {name "Atlas"  lead "Carol Davis"  budget 350000.0  priority (Priority.High {})} 
     {name "Meridian"  lead "Frank Lee"  budget 200000.0  priority (Priority.Medium {})} 
@@ -90,7 +90,7 @@ seedProjects (|
   yield {})
 
 seedTickets (|
-  full *tickets = [
+  *tickets = [
     {
       title "Fix auth timeout"
       project "Phoenix"
@@ -186,7 +186,7 @@ seedTickets (|
   yield {})
 
 seedCustomers (|
-  full *customers = [
+  *customers = [
     {name "Acme Corp"  email "admin@acme.com"  tier (Tier.Enterprise {})} 
     {name "Widgets Inc"  email "hello@widgets.io"  tier (Tier.Pro {})} 
     {name "Startup Labs"  email "team@startuplabs.dev"  tier (Tier.Free {})} 
@@ -203,7 +203,7 @@ seedCustomers (|
   yield {})
 
 seedProducts (|
-  full *products = [
+  *products = [
     {name "Laptop Pro 16"  price 2499.99  category (Category.Electronics {})  inStock (Active.Yes {})} 
     {name "Wireless Mouse"  price 49.99  category (Category.Electronics {})  inStock (Active.Yes {})} 
     {name "USB-C Hub"  price 79.99  category (Category.Electronics {})  inStock (Active.No {})} 
@@ -223,7 +223,7 @@ seedProducts (|
   yield {})
 
 seedOrders (|
-  full *orders = [
+  *orders = [
     {customer "Acme Corp"  product "Laptop Pro 16"  quantity 50  total 124999.5} 
     {customer "Acme Corp"  product "4K Monitor"  quantity 50  total 29999.5} 
     {customer "Acme Corp"  product "IDE License"  quantity 100  total 19999.0} 
@@ -253,7 +253,7 @@ seedOrders (|
   yield {})
 
 seedTeams (|
-  full *teams = [
+  *teams = [
     {
       name "Platform"
       members [
@@ -297,7 +297,7 @@ seedTeams (|
   yield {})
 
 seedLogs (|
-  full *logs = [
+  *logs = [
     {timestamp 1710900000  level (Level.Info {})  message "Server started on port 8080"  source "main"} 
     {
       timestamp 1710900001
@@ -407,7 +407,7 @@ seedLogs (|
   yield {})
 
 seedMetrics (|
-  full *metrics = [
+  *metrics = [
     {name "http_requests_total"  value 48291.0  tags "method=GET,status=200"} 
     {name "http_requests_total"  value 12847.0  tags "method=POST,status=201"} 
     {name "http_requests_total"  value 342.0  tags "method=POST,status=400"} 

@@ -272,7 +272,7 @@ fn io_arg_to_running_fn_still_runs() {
     assert_stdout(
         "ioarg_run",
         r#"with {
-_  runIt  (\io -> base.run io)
+_  runIt  (\io -> base.run [] io)
 }
 (|
   runIt (? (Bool.True {})

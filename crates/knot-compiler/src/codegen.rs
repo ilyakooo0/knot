@@ -2163,6 +2163,48 @@ impl<M: cranelift_module::Module> Codegen<M> {
         }
     }
 
+    /// `run`/`run1`: curried 2-param (the `&`-id list + the relation). The list
+    /// is compile-time only (the acknowledgment is checked at build time) — the
+    /// inner drops it and calls the runtime fn with the relation.
+    fn define_stdlib_run(&mut self, name: &str, rt_name: &str) {
+        let inner_id = self.declare_closure_fn(&format!("__stdlib_{}_apply", name));
+
+        // Outer: takes the id list, returns the inner closure (the list is env).
+        let (func_id, _) = self.global_fns[&Self::stdlib_key(name)];
+        let mut outer_sig = self.module.make_signature();
+        outer_sig.params.push(AbiParam::new(self.ptr_type)); // db
+        outer_sig.params.push(AbiParam::new(self.ptr_type)); // the id list
+        outer_sig.returns.push(AbiParam::new(self.ptr_type));
+
+        let fn_name = name.to_string();
+        self.build_function(func_id, outer_sig, |cg, builder, entry| {
+            let list = builder.block_params(entry)[1];
+            let inner_ref = cg.module.declare_func_in_func(inner_id, builder.func);
+            let inner_addr = builder.ins().func_addr(cg.ptr_type, inner_ref);
+            let (name_ptr, name_len) = cg.string_ptr(builder, &fn_name);
+            let result = cg.call_rt(
+                builder,
+                "knot_value_function",
+                &[inner_addr, list, name_ptr, name_len],
+            );
+            builder.ins().return_(&[result]);
+        });
+
+        // Inner: drops the list (env), calls the runtime fn with the relation.
+        let mut inner_sig = self.module.make_signature();
+        inner_sig.params.push(AbiParam::new(self.ptr_type)); // db
+        inner_sig.params.push(AbiParam::new(self.ptr_type)); // env = the id list (dropped)
+        inner_sig.params.push(AbiParam::new(self.ptr_type)); // the relation
+        inner_sig.returns.push(AbiParam::new(self.ptr_type));
+
+        let rt_name = rt_name.to_string();
+        self.build_function(inner_id, inner_sig, |cg, builder, entry| {
+            let rel = builder.block_params(entry)[2];
+            let result = cg.call_rt(builder, &rt_name, &[rel]);
+            builder.ins().return_(&[result]);
+        });
+    }
+
     /// Define a 1-param stdlib function that directly delegates to a runtime function.
     /// Reads the stdlib fn from its flattened `base.<name>` key (unshadowable).
     fn define_stdlib_fn_1(&mut self, name: &str, rt_name: &str) {
@@ -3545,8 +3587,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
 
         // File system: 1-param (IO-returning)
         self.define_stdlib_fn_1("readFile", "knot_fs_read_file_io");
-        self.define_stdlib_fn_1("run", "knot_relation_run_io");
-        self.define_stdlib_fn_1("run1", "knot_relation_run1");
+        // run/run1 are 2-param (the &-id list + the query); the generic path
+        // drops the list and calls the runtime fn with the relation.
+        self.define_stdlib_run("run", "knot_relation_run_io");
+        self.define_stdlib_run("run1", "knot_relation_run1");
         self.define_stdlib_fn_1("fileExists", "knot_fs_file_exists_io");
         self.define_stdlib_fn_1("removeFile", "knot_fs_remove_file_io");
         self.define_stdlib_fn_1("listDir", "knot_fs_list_dir_io");
@@ -7191,21 +7235,35 @@ impl<M: cranelift_module::Module> Codegen<M> {
             return v;
         }
 
-        // Special case: `run *source` / `run1 *source` — the explicit query→data
-        // boundary. Reads the whole source into memory (a full in-memory read,
-        // reported by the build-time Warning) and wraps the materialized
-        // relation as `IO (Vec a)` / `IO a`.
+        // Special case: `run [ids] query` / `run1 [ids] query` — the explicit
+        // query→data boundary. The first argument is a Vec of `&`-ids
+        // acknowledging which sources this run reads in full. A source read
+        // fully but not in the list warns; an id in the list but not read fully
+        // is a build error.
         if matches!(Self::query_form_name(func_expr), Some("run") | Some("run1"))
-            && args.len() == 1
+            && args.len() == 2
             && !user_shadows_special
-            && let Some(source_name) = self.resolve_source(args[0])
+            && let Some(source_name) = self.resolve_source(args[1])
             && let Some(schema) = self.source_schemas.get(&source_name).cloned()
         {
             let fn_name = Self::query_form_name(func_expr).unwrap();
-            // A `-- allow full read` comment on this line (or the line above)
-            // opts this specific run/run1 out of the full-read warning — the
-            // same source may be read partially elsewhere.
-            if !self.suppresses_full_read_warning(expr.span) {
+            // The acknowledged ids (the `&`-paths in the list).
+            let acked = self.nameof_ids_in(args[0]);
+            let my_id = self.nameof_path(args[1]);
+            // An acknowledged id that isn't the source this run reads — the id
+            // claims a full read that doesn't happen. Build error.
+            for id in &acked {
+                if id != &my_id {
+                    self.push_codegen_error(
+                        builder,
+                        expr.span,
+                        format!(
+                            "the `{fn_name}` list acknowledges `{id}`, but this `{fn_name}` reads `*{source_name}` — `{id}` is not read fully here"
+                        ),
+                    );
+                }
+            }
+            if !acked.contains(&my_id) {
                 self.in_memory_source_reads
                     .insert(source_name.clone(), (expr.span, fn_name.to_string()));
             }
@@ -16393,9 +16451,22 @@ impl<M: cranelift_module::Module> Codegen<M> {
         rel
     }
 
+    /// Extract the `&`-ids from a Vec literal of NameOf expressions (the run
+    /// acknowledgment list). Each element's qualified path.
+    fn nameof_ids_in(&self, expr: &ast::Expr) -> Vec<String> {
+        match &expr.node {
+            ast::ExprKind::List(items) => items
+                .iter()
+                .map(|item| match &item.node {
+                    ast::ExprKind::NameOf(inner) => self.nameof_path(inner),
+                    _ => self.nameof_path(item),
+                })
+                .collect(),
+            _ => vec![],
+        }
+    }
+
     /// The qualified path of a value's original binding: `file.knot:line:name`.
-    /// Resolves through let-bindings (the same resolution as accessing the
-    /// value), so `nameOf y` where `y = x` gives `x`'s path.
     fn nameof_path(&self, expr: &ast::Expr) -> String {
         // The innermost named binding in the expression. For a source, the
         // source name. For a variable, the binding's name (resolved through

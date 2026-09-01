@@ -10928,6 +10928,10 @@ impl Infer {
         // The explicit query→data boundary: forces a (possibly source-backed)
         // relation and returns the materialized concrete `Vec a`. After `run`,
         // the value is frozen data — further reads never re-query.
+        //
+        // The first argument is a Vec of `&`-ids (qualified paths) acknowledging
+        // which sources this run reads in full. A source read fully but not in
+        // the list warns; an id in the list but not read fully is a build error.
         {
             let a = self.fresh_var();
             self.bind_top(
@@ -10938,17 +10942,21 @@ impl Infer {
                     constraints: vec![],
                     unit_binops: vec![],
                     ty: Ty::Fun(
-                        Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
-                        Box::new(Ty::IO(Box::new(Ty::Con("Vec".into(), vec![Ty::Var(a)])))),
+                        Box::new(Ty::Con("Vec".into(), vec![Ty::Text])),
+                        Box::new(Ty::Fun(
+                            Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
+                            Box::new(Ty::IO(Box::new(Ty::Con("Vec".into(), vec![Ty::Var(a)])))),
+                        )),
                     ),
                 },
             );
         }
 
-        // run1 : ∀a. [a] -> IO a
+        // run1 : ∀a. Vec Text -> [a] -> IO a
         // Extract the single row of a one-element relation, erroring unless it
         // holds exactly one row. The scalar extractor for the aggregates/tests
-        // (count, sum, any, …).
+        // (count, sum, any, …). The Vec Text is the `&`-id acknowledgment list,
+        // same as `run`.
         {
             let a = self.fresh_var();
             self.bind_top(
@@ -10959,8 +10967,11 @@ impl Infer {
                     constraints: vec![],
                     unit_binops: vec![],
                     ty: Ty::Fun(
-                        Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
-                        Box::new(Ty::IO(Box::new(Ty::Var(a)))),
+                        Box::new(Ty::Con("Vec".into(), vec![Ty::Text])),
+                        Box::new(Ty::Fun(
+                            Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
+                            Box::new(Ty::IO(Box::new(Ty::Var(a)))),
+                        )),
                     ),
                 },
             );

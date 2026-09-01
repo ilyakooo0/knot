@@ -1690,7 +1690,6 @@ impl Parser {
                 let lit = self.parse_postfix_from(lit)?;
                 self.parse_application_from(lit)
             }
-            TokenKind::Ampersand => self.parse_nameof_sigil(),
             _ => self.parse_application(),
         }
     }
@@ -2210,11 +2209,7 @@ impl Parser {
                     }
                 }
             }
-            TokenKind::Ampersand => {
-                // `&` is only a route query-param separator — never an atom.
-                self.error("unexpected '&'");
-                None
-            }
+            TokenKind::Ampersand => self.parse_nameof_sigil(),
             TokenKind::LParen => {
                 self.advance();
                 self.delimiter_depth += 1;

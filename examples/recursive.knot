@@ -14,7 +14,7 @@ directReports (|
     {manager "Bob"  report "Dave"}
   ]
   base.println "Direct reports:"
-  rows <- base.run directReports
+  rows <- base.run [] directReports
   base.println (base.show rows)
   base.println ("Total: " ++ base.show (base.count directReports))
   yield {})

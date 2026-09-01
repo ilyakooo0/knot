@@ -37,10 +37,10 @@ doubled (|
 }
 (|
   full *items = [{n 1}]
-  a <- base.run doubled
+  a <- base.run [] doubled
   base.println (base.show a)
   full *items = [{n 5}]
-  b <- base.run doubled
+  b <- base.run [] doubled
   base.println (base.show b)
   yield {})"#,
         "\"[{n 2}]\"\n\"[{n 10}]\"\n{}",

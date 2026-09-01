@@ -8460,6 +8460,55 @@ fn format_value_field(v: *mut Value) -> String {
     format_value_iter(v, true)
 }
 
+/// Serialize a value as a knot-parseable expression (for the `dump` command).
+/// Records use 2+ spaces between fields (`{name "a"  age 30}`), relations use
+/// 2+ spaces between elements (`[r0  r1]`), text is quoted and escaped, and
+/// constructors/bools/ints/floats render in the knot surface syntax.
+fn format_value_knot(v: *mut Value) -> String {
+    match unsafe { as_ref(v) } {
+        Value::Int(n) => n.to_string(),
+        Value::Float(n) => {
+            if n.fract() == 0.0 && n.is_finite() {
+                format!("{:.1}", n)
+            } else {
+                n.to_string()
+            }
+        }
+        Value::Text(s) => format!("\"{}\"", json_escape(s)),
+        Value::Bytes(b) => {
+            let mut s = String::from("b\"");
+            for byte in b.iter() {
+                s.push_str(&format!("{:02x}", byte));
+            }
+            s.push('"');
+            s
+        }
+        Value::Bool(b) => if *b { "Bool.True {}" } else { "Bool.False {}" }.to_string(),
+        Value::Unit => "{}".to_string(),
+        Value::Record(fields) => {
+            let parts: Vec<String> = fields
+                .iter()
+                .map(|f| format!("{} {}", f.name, format_value_knot(f.value)))
+                .collect();
+            format!("{{{}}}", parts.join("  "))
+        }
+        Value::Relation(rows) => {
+            let parts: Vec<String> = rows.iter().map(|r| format_value_knot(*r)).collect();
+            format!("[{}]", parts.join("  "))
+        }
+        Value::Constructor(tag, payload) => {
+            if is_nullary_payload(*payload) {
+                // A nullary constructor: Tag {} (the payload is the unit record).
+                format!("{} {{}}", tag)
+            } else {
+                // A payload constructor: Tag {field value ...} or Tag value.
+                format!("{} {}", tag, format_value_knot(*payload))
+            }
+        }
+        _ => format_value_iter(v, true),
+    }
+}
+
 /// Rendering for a structured-log context field's `raw` (multiline block)
 /// form: like `format_value`, but a top-level `Text` is NOT wrapped in
 /// quotes — the block body should read as the raw text the program logged,
@@ -22709,6 +22758,252 @@ pub extern "C-unwind" fn knot_db_handle(
         std::process::exit(1);
     }
     1
+}
+
+/// `knot dump` — print a knot program that recreates the database state: the
+/// schema declarations (the `with { ... }` block) and the writes (the
+/// `*rel = [...]` assignments with the current values). Running the output
+/// program restores the exact database state.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_dump_handle(
+    argc: i32,
+    argv: *const *const u8,
+    db_path_ptr: *const u8,
+    db_path_len: usize,
+) -> i32 {
+    if argc < 2 {
+        return 0;
+    }
+    let arg1 = unsafe {
+        let ptr = *argv.add(1);
+        let mut len = 0;
+        while *ptr.add(len) != 0 {
+            len += 1;
+        }
+        String::from_utf8_lossy(std::slice::from_raw_parts(ptr, len)).to_string()
+    };
+
+    if arg1 != "dump" {
+        return 0;
+    }
+
+    let db_path = unsafe { str_from_raw(db_path_ptr, db_path_len) };
+    match dump_database(db_path.to_string()) {
+        Ok(program) => {
+            println!("{}", program);
+            1
+        }
+        Err(e) => {
+            eprintln!("knot dump: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Dump the database to a knot program: the schema declarations + the writes.
+fn dump_database(db_path: String) -> Result<String, String> {
+    let conn = Connection::open(&db_path).map_err(|e| format!("failed to open {}: {}", db_path, e))?;
+
+    // Read the schema (name -> descriptor).
+    let mut stmt = conn
+        .prepare("SELECT name, schema FROM _knot_schema ORDER BY name")
+        .map_err(|e| format!("failed to read _knot_schema: {}", e))?;
+    let sources: Vec<(String, String)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(|e| format!("failed to query _knot_schema: {}", e))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("failed to read schema rows: {}", e))?;
+
+    let mut decls = String::new();
+    let mut writes = String::new();
+
+    for (name, schema) in &sources {
+        // Reconstruct the declaration. The descriptor is the knot-type schema:
+        // a record (`{name Text  age Int}`) or an ADT (`(Circle{radius Int} | ...)`).
+        let type_name = capitalize(name);
+        let trimmed = schema.trim();
+        if trimmed.starts_with('(') {
+            // An ADT: (Ctor{f T} | Ctor2 {}). Convert the descriptor's
+            // `Ctor{f T}` to knot's `Ctor {f (T 1)}`.
+            let ctors = schema_descriptor_to_adt_ctors(trimmed);
+            decls.push_str(&format!("{}  {}\n", type_name, ctors.join("  ")));
+        } else {
+            // A record.
+            let fields = schema_descriptor_to_fields(trimmed);
+            decls.push_str(&format!("{}  {{{}}}\n", type_name, fields.join("  ")));
+        }
+        decls.push_str(&format!("Rel {}  *{}\n", type_name, name));
+
+        // Read the values from the table. For an ADT source, qualify the
+        // constructor tags with the type name (the dump's `Circle` → the
+        // knot-parseable `Shapes.Circle`).
+        let rows = read_source_rows(&conn, name, schema, None).0;
+        let row_strs: Vec<String> = rows
+            .iter()
+            .map(|r| {
+                let s = format_value_knot(*r);
+                if trimmed.starts_with('(') {
+                    // An ADT value: qualify the bare constructor tag.
+                    qualify_adt_ctor(&s, &type_name)
+                } else {
+                    s
+                }
+            })
+            .collect();
+        writes.push_str(&format!("  *{} = [{}]\n", name, row_strs.join("  ")));
+    }
+
+    // The program: the declarations + the writes.
+    let mut program = String::new();
+    program.push_str("with {\n");
+    program.push_str(&decls);
+    program.push_str("}\n");
+    program.push_str("(|\n");
+    program.push_str(&writes);
+    program.push_str("  yield {})\n");
+    Ok(program)
+}
+
+/// Capitalize a source name for the synthetic record type (e.g. `people` →
+/// `People`).
+fn capitalize(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+/// Convert a schema descriptor (`{name Text  age Int}`) to knot field
+/// declarations (`name Text`, `age Int`). The descriptor is the knot record
+/// format: fields separated by 2+ spaces, name and type by a single space.
+/// Handles nested relations (`col Rel {inner}`) and ADT tags.
+fn schema_descriptor_to_fields(schema: &str) -> Vec<String> {
+    // Strip ONE outer brace pair.
+    let t = schema.trim();
+    let inner = if t.starts_with('{') && t.ends_with('}') {
+        &t[1..t.len() - 1]
+    } else {
+        t
+    };
+    let inner = inner.trim();
+    // Split on 2+ spaces (the field separator).
+    let mut fields = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0;
+    let chars: Vec<char> = inner.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        match c {
+            '{' => { depth += 1; current.push(c); }
+            '}' => { depth -= 1; current.push(c); }
+            '[' => { depth += 1; current.push(c); }
+            ']' => { depth -= 1; current.push(c); }
+            ' ' if depth == 0 => {
+                // 2+ spaces separate fields; a single space is within a field.
+                let mut j = i;
+                while j < chars.len() && chars[j] == ' ' {
+                    j += 1;
+                }
+                if j - i >= 2 {
+                    // A field boundary.
+                    if !current.trim().is_empty() {
+                        fields.push(current.trim().to_string());
+                    }
+                    current = String::new();
+                    i = j;
+                    continue;
+                }
+                current.push(c);
+            }
+            _ => current.push(c),
+        }
+        i += 1;
+    }
+    if !current.trim().is_empty() {
+        fields.push(current.trim().to_string());
+    }
+    // The descriptor stores `Int`/`Float` without a unit. Knot requires one —
+    // emit `Int 1`/`Float 1` (dimensionless) for a bare numeric type.
+    fields
+        .into_iter()
+        .map(|f| {
+            let parts: Vec<&str> = f.splitn(2, ' ').collect();
+            if parts.len() == 2 {
+                let (name, ty) = (parts[0], parts[1]);
+                match ty {
+                    "Int" => format!("{} (Int 1)", name),
+                    "Float" => format!("{} (Float 1)", name),
+                    _ => f,
+                }
+            } else {
+                f
+            }
+        })
+        .collect()
+}
+
+/// Qualify a bare ADT constructor tag with the type name (`Circle {..}` →
+/// `Shapes.Circle {..}`).
+fn qualify_adt_ctor(value: &str, type_name: &str) -> String {
+    let trimmed = value.trim();
+    // The value is `Ctor {..}` or `Ctor {}` — qualify the leading Ctor.
+    if let Some(space) = trimmed.find(' ') {
+        let (ctor, rest) = trimmed.split_at(space);
+        if !ctor.contains('.') && ctor.chars().next().map_or(false, |c| c.is_uppercase()) {
+            return format!("{}.{}{}", type_name, ctor, rest);
+        }
+    }
+    value.to_string()
+}
+
+/// Convert an ADT schema descriptor (`(Circle{radius Int} | Point)`) to knot
+/// constructor declarations (`Circle {radius (Int 1)}`, `Point {}`).
+fn schema_descriptor_to_adt_ctors(schema: &str) -> Vec<String> {
+    // Strip the outer parens and split on ` | `.
+    let inner = schema.trim().trim_start_matches('(').trim_end_matches(')').trim();
+    let mut ctors = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0;
+    let chars: Vec<char> = inner.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        match c {
+            '{' => { depth += 1; current.push(c); }
+            '}' => { depth -= 1; current.push(c); }
+            '|' if depth == 0 => {
+                if !current.trim().is_empty() {
+                    ctors.push(adt_ctor_to_knot(current.trim()));
+                }
+                current = String::new();
+                i += 1;
+                continue;
+            }
+            _ => current.push(c),
+        }
+        i += 1;
+    }
+    if !current.trim().is_empty() {
+        ctors.push(adt_ctor_to_knot(current.trim()));
+    }
+    ctors
+}
+
+/// Convert one ADT constructor descriptor (`Circle{radius Int}` or `Point`) to
+/// the knot form (`Circle {radius (Int 1)}` or `Point {}`).
+fn adt_ctor_to_knot(ctor: &str) -> String {
+    let ctor = ctor.trim();
+    if let Some(brace) = ctor.find('{') {
+        let name = ctor[..brace].trim();
+        let fields_str = &ctor[brace..]; // `{radius Int}`
+        let fields = schema_descriptor_to_fields(fields_str);
+        format!("{} {{{}}}", name, fields.join("  "))
+    } else {
+        // A nullary constructor.
+        format!("{} {{}}", ctor)
+    }
 }
 
 fn generate_openapi(name: &str, table: &RouteTable) -> String {

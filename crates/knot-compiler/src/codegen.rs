@@ -1983,6 +1983,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
 
         // DB explorer TUI
         self.declare_rt("knot_db_handle", &[types::I32, p, p, p], &[types::I32]);
+        self.declare_rt("knot_dump_handle", &[types::I32, p, p, p], &[types::I32]);
 
         // Documentation comments (`---`), embedded and printed by the `docs`
         // subcommand. `knot_doc_add(name_ptr, name_len, md_ptr, md_len)`
@@ -4475,6 +4476,31 @@ impl<M: cranelift_module::Module> Codegen<M> {
 
             builder.switch_to_block(normal_block2);
             builder.seal_block(normal_block2);
+
+            // Check if this is a "dump" command — print the database state as a
+            // knot program and exit.
+            let dump_result = {
+                let func_id = cg.runtime_fns["knot_dump_handle"];
+                let func_ref = cg.module.declare_func_in_func(func_id, builder.func);
+                let call = builder
+                    .ins()
+                    .call(func_ref, &[argc, argv, db_path_ptr_pre, db_path_len_pre]);
+                builder.inst_results(call)[0]
+            };
+
+            let normal_block_dump = builder.create_block();
+            let dump_exit_block = builder.create_block();
+            builder
+                .ins()
+                .brif(dump_result, dump_exit_block, &[], normal_block_dump, &[]);
+
+            builder.switch_to_block(dump_exit_block);
+            builder.seal_block(dump_exit_block);
+            let zero_dump = builder.ins().iconst(types::I32, 0);
+            builder.ins().return_(&[zero_dump]);
+
+            builder.switch_to_block(normal_block_dump);
+            builder.seal_block(normal_block_dump);
 
             // Check if this is a "docs" command — print the embedded `---` doc
             // comments and exit without running main.

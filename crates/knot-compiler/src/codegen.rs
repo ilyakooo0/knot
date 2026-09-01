@@ -16408,8 +16408,8 @@ impl<M: cranelift_module::Module> Codegen<M> {
         } else {
             expr.span
         };
-        let (line, _) = knot::diagnostic::line_col(&self.source_text, span.start);
-        format!("{}:{}:{}", self.source_name, line, name)
+        let (line, col) = knot::diagnostic::line_col(&self.source_text, span.start);
+        format!("{}:{}:{}:{}", self.source_name, line, col, name)
     }
 
     /// Resolve a value's binding name (the innermost named binding). For a

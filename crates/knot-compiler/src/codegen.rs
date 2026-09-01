@@ -35,6 +35,15 @@ enum SourceBindInvalidation {
     AllSources,
 }
 
+/// One `run [ids] query` acknowledgment frame: the `&`-id list and the sources
+/// actually read fully while the query was compiled.
+struct RunAckFrame {
+    acked: Vec<String>,
+    read_ids: HashSet<String>,
+    span: ast::Span,
+    fn_name: String,
+}
+
 pub struct Codegen<M: cranelift_module::Module = ObjectModule> {
     module: M,
     ctx: Context,
@@ -252,6 +261,12 @@ pub struct Codegen<M: cranelift_module::Module = ObjectModule> {
     /// Source name → its `*name` declaration span (for the full-read warning's
     /// trace back to where the relation is declared).
     source_decl_spans: HashMap<String, ast::Span>,
+
+    /// The stack of `run [ids] query` acknowledgment frames (nested runs nest).
+    /// While a frame is on top, full in-memory reads are checked against its
+    /// `&`-id list: an acked read is suppressed; after the query is compiled,
+    /// an acked id that was never read fully is a build error.
+    run_ack_stack: Vec<RunAckFrame>,
 
     // Resolved monad types for desugared do-blocks (from type inference)
     monad_info: MonadInfo,
@@ -1467,6 +1482,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
             relational_do_spans: HashSet::new(),
             in_memory_source_reads: HashMap::new(),
             source_decl_spans: HashMap::new(),
+            run_ack_stack: Vec::new(),
             monad_info: HashMap::new(),
             nullable_ctors: HashMap::new(),
             io_functions: HashSet::new(),
@@ -5054,18 +5070,18 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 // A bare `*rel` read that reaches here was not consumed by any
                 // SQL-pushdown matcher — it loads the whole relation into
                 // memory via `knot_source_read`. Track it for the build-time
-                // INFO diagnostic naming full in-memory reads.
-                self.in_memory_source_reads
-                    .insert(name.clone(), (expr.span, "a direct read".to_string()));
-                let schema = self.source_schemas.get(name).cloned().unwrap_or_default();
-                let (name_ptr, name_len) = self.string_ptr(builder, name);
+                // full-read warning (checked against a `run [ids]` ack frame).
+                let name = name.clone();
+                self.record_full_read(&name, expr.span, "a direct read".to_string());
+                let schema = self.source_schemas.get(&name).cloned().unwrap_or_default();
+                let (name_ptr, name_len) = self.string_ptr(builder, &name);
                 let (schema_ptr, schema_len) = self.string_ptr(builder, &schema);
                 let rel = self.call_rt(
                     builder,
                     "knot_source_read",
                     &[db, name_ptr, name_len, schema_ptr, schema_len],
                 );
-                if self.scalar_sources.contains(name) || self.single_value_sources.contains(name) {
+                if self.scalar_sources.contains(&name) || self.single_value_sources.contains(&name) {
                     // Single-value source: unwrap the one row's `_value` field
                     // back to the bare value (or a default if never written).
                     self.call_rt(builder, "knot_scalar_source_unwrap", &[rel])
@@ -7239,42 +7255,37 @@ impl<M: cranelift_module::Module> Codegen<M> {
         // query→data boundary. The first argument is a Vec of `&`-ids
         // acknowledging which sources this run reads in full. A source read
         // fully but not in the list warns; an id in the list but not read fully
-        // is a build error.
+        // is a build error. The frame covers the whole query — a bare source
+        // AND a computed query (a fn boundary, a comprehension) that full-reads.
         if matches!(Self::query_form_name(func_expr), Some("run") | Some("run1"))
             && args.len() == 2
             && !user_shadows_special
-            && let Some(source_name) = self.resolve_source(args[1])
-            && let Some(schema) = self.source_schemas.get(&source_name).cloned()
         {
-            let fn_name = Self::query_form_name(func_expr).unwrap();
-            // The acknowledged ids (the `&`-paths in the list).
-            let acked = self.nameof_ids_in(args[0]);
-            let my_id = self.nameof_path(args[1]);
-            // An acknowledged id that isn't the source this run reads — the id
-            // claims a full read that doesn't happen. Build error.
-            for id in &acked {
-                if id != &my_id {
+            let fn_name = Self::query_form_name(func_expr).unwrap().to_string();
+            // Push the ack frame: the acknowledged ids; the sources read fully
+            // while the query compiles are recorded into it.
+            self.run_ack_stack.push(RunAckFrame {
+                acked: self.nameof_ids_in(args[0]),
+                read_ids: HashSet::new(),
+                span: expr.span,
+                fn_name: fn_name.clone(),
+            });
+            let rel = self.compile_expr(builder, args[1], env, db);
+            let frame = self.run_ack_stack.pop().unwrap();
+            // An acked id that was never read fully — the id claims a full read
+            // that doesn't happen. Build error.
+            for id in &frame.acked {
+                if !frame.read_ids.contains(id) {
                     self.push_codegen_error(
                         builder,
-                        expr.span,
+                        frame.span,
                         format!(
-                            "the `{fn_name}` list acknowledges `{id}`, but this `{fn_name}` reads `*{source_name}` — `{id}` is not read fully here"
+                            "the `{}` list acknowledges `{}`, but this `{}` never reads it fully — remove it, or the query does not read that source in full",
+                            frame.fn_name, id, frame.fn_name
                         ),
                     );
                 }
             }
-            if !acked.contains(&my_id) {
-                self.in_memory_source_reads
-                    .insert(source_name.clone(), (expr.span, fn_name.to_string()));
-            }
-            self.emit_stm_track_read(builder, &source_name);
-            let (name_ptr, name_len) = self.string_ptr(builder, &source_name);
-            let (schema_ptr, schema_len) = self.string_ptr(builder, &schema);
-            let rel = self.call_rt(
-                builder,
-                "knot_source_read",
-                &[db, name_ptr, name_len, schema_ptr, schema_len],
-            );
             // run → IO (Vec a); run1 → IO a (the single row).
             let rt = if fn_name == "run1" { "knot_relation_run1" } else { "knot_relation_run_io" };
             return self.call_rt(builder, rt, &[rel]);
@@ -16449,6 +16460,28 @@ impl<M: cranelift_module::Module> Codegen<M> {
             self.call_rt_void(builder, "knot_relation_push", &[rel, val]);
         }
         rel
+    }
+
+    /// Record a full in-memory read of `source_name` (at `read_span`, via
+    /// `how`). If a `run [ids]` frame is on top, the read counts toward it: an
+    /// acked read is suppressed; an unacked one still warns. With no frame, the
+    /// read always warns.
+    fn record_full_read(&mut self, source_name: &str, read_span: ast::Span, how: String) {
+        let decl_span = self
+            .source_decl_spans
+            .get(source_name)
+            .copied()
+            .unwrap_or(read_span);
+        let (line, col) = knot::diagnostic::line_col(&self.source_text, decl_span.start);
+        let id = format!("{}:{}:{}:{}", self.source_name, line, col, source_name);
+        if let Some(frame) = self.run_ack_stack.last_mut() {
+            frame.read_ids.insert(id.clone());
+            if frame.acked.contains(&id) {
+                return;
+            }
+        }
+        self.in_memory_source_reads
+            .insert(source_name.to_string(), (read_span, how));
     }
 
     /// Extract the `&`-ids from a Vec literal of NameOf expressions (the run

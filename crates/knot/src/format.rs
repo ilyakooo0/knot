@@ -627,7 +627,7 @@ fn render_expr_inline(e: &Expr, parent: Prec) -> String {
     }
     match &e.node {
         ExprKind::Lit(l) => render_literal(l),
-        ExprKind::NameOf(inner) => format!("nameOf {}", render_expr_inline(inner, Prec::Atom)),
+        ExprKind::NameOf(inner) => format!("&{}", render_expr_inline(inner, Prec::Atom)),
         // `yield` is refused by the parser's `can_start_atom` in application
         // argument position (it would be ambiguous with do-block yields), so
         // a Var named `yield` must keep its parens there: `f (yield)`.

@@ -20691,7 +20691,7 @@ pub(crate) fn expr_has_tag_column(
 fn pretty_expr(expr: &ast::Expr) -> String {
     match &expr.node {
         ast::ExprKind::Lit(lit) => pretty_lit(lit),
-        ast::ExprKind::NameOf(inner) => format!("nameOf {}", pretty_expr(inner)),
+        ast::ExprKind::NameOf(inner) => format!("&{}", pretty_expr(inner)),
         ast::ExprKind::Var(name) => name.as_str().to_string(),
         ast::ExprKind::ImplicitRef(name) => format!("^{name}"),
         ast::ExprKind::CollectFold(name) => format!("<>{name}"),

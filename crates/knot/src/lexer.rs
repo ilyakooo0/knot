@@ -27,7 +27,6 @@ pub enum TokenKind {
     With,
     Refine,
     Forall,
-    NameOf,
 
     // Delimiters
     LParen,
@@ -109,7 +108,6 @@ impl TokenKind {
             TokenKind::With => "'with'",
             TokenKind::Refine => "'refine'",
             TokenKind::Forall => "'forall'",
-            TokenKind::NameOf => "'nameOf'",
             TokenKind::LParen => "'('",
             TokenKind::RParen => "')'",
             TokenKind::LBrace => "'{'",
@@ -165,7 +163,6 @@ impl TokenKind {
             TokenKind::With => Some("with"),
             TokenKind::Refine => Some("refine"),
             TokenKind::Forall => Some("forall"),
-            TokenKind::NameOf => Some("nameOf"),
             _ => None,
         }
     }
@@ -553,7 +550,6 @@ impl<'src> Lexer<'src> {
                 "with" => return TokenKind::With,
                 "refine" => return TokenKind::Refine,
                 "forall" => return TokenKind::Forall,
-                "nameOf" => return TokenKind::NameOf,
                 _ => {}
             }
             TokenKind::Lower(text.to_owned())

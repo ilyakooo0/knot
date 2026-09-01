@@ -1690,15 +1690,24 @@ impl Parser {
                 let lit = self.parse_postfix_from(lit)?;
                 self.parse_application_from(lit)
             }
-            TokenKind::NameOf => self.parse_nameof(),
+            TokenKind::Ampersand => self.parse_nameof_sigil(),
             _ => self.parse_application(),
         }
     }
 
-    /// `nameOf x` — the qualified path of the value `x` resolves to.
-    fn parse_nameof(&mut self) -> Option<Expr> {
+    /// `&x` — the qualified path of the value `x` resolves to (no whitespace
+    /// between `&` and the operand — the sigil is immediately adjacent).
+    fn parse_nameof_sigil(&mut self) -> Option<Expr> {
         let start = self.span();
-        self.advance(); // nameOf
+        self.advance(); // &
+        // The operand must be immediately adjacent (no whitespace) — `&x`, not
+        // `& x`.
+        let next = self.tokens.get(self.pos)?;
+        let cur_end = start.end;
+        if next.span.start != cur_end {
+            self.error("expected an expression immediately after `&` (no whitespace)");
+            return None;
+        }
         let operand = self.parse_unary()?;
         let span = Span::new(start.start, operand.span.end);
         Some(Spanned::new(ExprKind::NameOf(Box::new(operand)), span))
@@ -1828,9 +1837,15 @@ impl Parser {
                 true
             }
             TokenKind::Ampersand => {
-                // `&` is only a route query-param separator (`?{q}&{..}`),
-                // never an atom starter.
-                false
+                // `&x` (no whitespace) is the nameOf sigil — a valid atom
+                // starter. A bare `&` (a route query-param separator `?{q}&{..}`)
+                // is not.
+                if let Some(next) = self.tokens.get(self.pos + 1) {
+                    let cur_end = self.peek_token().span.end;
+                    next.span.start == cur_end
+                } else {
+                    false
+                }
             }
             TokenKind::Caret => {
                 // Implicit field projection `^name` only when `^` is immediately

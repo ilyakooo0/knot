@@ -22527,6 +22527,10 @@ pub extern "C-unwind" fn knot_api_register(
 
 static DOC_REGISTRY: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
 
+/// The `with { ... }` block's source text, embedded by the compiler so the
+/// `dump` subcommand prints the exact declarations.
+static SCHEMA_SOURCE: Mutex<Option<String>> = Mutex::new(None);
+
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_doc_add(
     name_ptr: *const u8,
@@ -22540,6 +22544,13 @@ pub extern "C-unwind" fn knot_doc_add(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .push((name, md));
+}
+
+/// Embed the `with { ... }` block's source text (called by the generated main).
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_schema_source_set(src_ptr: *const u8, src_len: usize) {
+    let src = unsafe { str_from_raw(src_ptr, src_len) }.to_string();
+    *SCHEMA_SOURCE.lock().unwrap_or_else(|e| e.into_inner()) = Some(src);
 }
 
 /// Render one line of markdown with light terminal syntax highlighting.
@@ -22814,29 +22825,36 @@ fn dump_database(db_path: String) -> Result<String, String> {
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("failed to read schema rows: {}", e))?;
 
-    let mut decls = String::new();
     let mut writes = String::new();
 
-    for (name, schema) in &sources {
-        // Reconstruct the declaration. The descriptor is the knot-type schema:
-        // a record (`{name Text  age Int}`) or an ADT (`(Circle{radius Int} | ...)`).
-        let type_name = capitalize(name);
-        let trimmed = schema.trim();
-        if trimmed.starts_with('(') {
-            // An ADT: (Ctor{f T} | Ctor2 {}). Convert the descriptor's
-            // `Ctor{f T}` to knot's `Ctor {f (T 1)}`.
-            let ctors = schema_descriptor_to_adt_ctors(trimmed);
-            decls.push_str(&format!("{}  {}\n", type_name, ctors.join("  ")));
-        } else {
-            // A record.
-            let fields = schema_descriptor_to_fields(trimmed);
-            decls.push_str(&format!("{}  {{{}}}\n", type_name, fields.join("  ")));
+    // The type name for each source: from the embedded source's `Rel Type
+    // *name` declaration (the exact name), else the capitalized source name.
+    let schema_source = SCHEMA_SOURCE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let type_name_for = |name: &str| -> String {
+        if let Some(src) = &schema_source {
+            // Find the `Rel Type *name` declaration.
+            for line in src.lines() {
+                let line = line.trim();
+                if line.starts_with("Rel ") && line.ends_with(&format!("*{}", name)) {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if parts.len() >= 3 {
+                        return parts[1].to_string();
+                    }
+                }
+            }
         }
-        decls.push_str(&format!("Rel {}  *{}\n", type_name, name));
+        capitalize(name)
+    };
 
+    for (name, schema) in &sources {
         // Read the values from the table. For an ADT source, qualify the
         // constructor tags with the type name (the dump's `Circle` → the
-        // knot-parseable `Shapes.Circle`).
+        // knot-parseable `Shape.Circle`).
+        let type_name = type_name_for(name);
+        let trimmed = schema.trim();
         let rows = read_source_rows(&conn, name, schema, None).0;
         let row_strs: Vec<String> = rows
             .iter()
@@ -22853,11 +22871,32 @@ fn dump_database(db_path: String) -> Result<String, String> {
         writes.push_str(&format!("  *{} = [{}]\n", name, row_strs.join("  ")));
     }
 
+    // The declarations: the embedded `with { ... }` source (the exact text the
+    // program was compiled with) if available, else reconstruct from the
+    // descriptors.
+    let decls = schema_source.unwrap_or_else(|| {
+            // Fallback: reconstruct from the descriptors.
+            let mut d = String::new();
+            for (name, schema) in &sources {
+                let type_name = capitalize(name);
+                let trimmed = schema.trim();
+                if trimmed.starts_with('(') {
+                    let ctors = schema_descriptor_to_adt_ctors(trimmed);
+                    d.push_str(&format!("{}  {}\n", type_name, ctors.join("  ")));
+                } else {
+                    let fields = schema_descriptor_to_fields(trimmed);
+                    d.push_str(&format!("{}  {{{}}}\n", type_name, fields.join("  ")));
+                }
+                d.push_str(&format!("Rel {}  *{}\n", type_name, name));
+            }
+            format!("{{\n{}}}", d)
+        });
+
     // The program: the declarations + the writes.
     let mut program = String::new();
-    program.push_str("with {\n");
+    program.push_str("with ");
     program.push_str(&decls);
-    program.push_str("}\n");
+    program.push('\n');
     program.push_str("(|\n");
     program.push_str(&writes);
     program.push_str("  yield {})\n");

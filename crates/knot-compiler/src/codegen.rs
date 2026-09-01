@@ -1984,6 +1984,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
         // DB explorer TUI
         self.declare_rt("knot_db_handle", &[types::I32, p, p, p], &[types::I32]);
         self.declare_rt("knot_dump_handle", &[types::I32, p, p, p], &[types::I32]);
+        self.declare_rt("knot_schema_source_set", &[p, p], &[]);
 
         // Documentation comments (`---`), embedded and printed by the `docs`
         // subcommand. `knot_doc_add(name_ptr, name_len, md_ptr, md_len)`
@@ -4366,6 +4367,18 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 let (nptr, nlen) = cg.string_ptr(builder, dname);
                 let (dptr, dlen) = cg.string_ptr(builder, ddoc);
                 cg.call_rt_void(builder, "knot_doc_add", &[nptr, nlen, dptr, dlen]);
+            }
+
+            // Embed the `with { ... }` block's source text so the `dump`
+            // subcommand prints the exact declarations (the type names, the
+            // nested type names, the formatting) instead of reconstructing
+            // them from the schema descriptors. The record's span covers the
+            // `{ ... }` block.
+            if let ast::ExprKind::With { record, .. } = &program.node {
+                let span = record.span;
+                let with_src = cg.source_text[span.start..span.end].to_string();
+                let (sptr, slen) = cg.string_ptr(builder, &with_src);
+                cg.call_rt_void(builder, "knot_schema_source_set", &[sptr, slen]);
             }
 
             // Register route tables for the api command

@@ -151,6 +151,11 @@ fn walk_decl(decl: &DeclView, r: &mut Refs) {
             r.sources.insert(sub.relation.clone());
             r.sources.insert(sup.relation.clone());
         }
+        DeclViewKind::Arg { default } => {
+            if let Some(d) = default {
+                walk_expr(d, r);
+            }
+        }
     }
 }
 
@@ -225,7 +230,7 @@ fn walk_expr(e: &Expr, r: &mut Refs) {
         ExprKind::CollectFold(_) => {}
         ExprKind::TypeHole => {}
         ExprKind::TypeCtor { .. }
-        | ExprKind::SourceDecl { .. }
+        | ExprKind::SourceDecl { .. } | ExprKind::ArgDecl { .. }
         | ExprKind::SubsetConstraint { .. } => {}
         ExprKind::RouteDecl { .. } => {}
         ExprKind::Var(name) => {

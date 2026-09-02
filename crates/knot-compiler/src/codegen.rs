@@ -1000,24 +1000,43 @@ fn compile_inner<M: cranelift_module::Module>(
     cg.collect_declarations(program);
     // Compute overridable constants: 0-param Fun declarations with scalar types
     for decl in decl_views(program) {
-        if let DeclViewKind::Fun {
-            body: Some(body), ..
-        } = decl.kind
-        {
-            let name = decl.name;
-            if name == "main" {
-                continue;
-            }
-            if let Some((_, 0)) = cg.global_fns.get(name)
-                && let Some(ty_str) = type_info.get(name)
-                && let Some(base_type) =
-                    scalar_override_type(ty_str, &cg.type_aliases, &cg.refined_types)
-            {
-                cg.overridable_constants.insert(name.to_string(), base_type);
-                if let Some(disp) = format_default_value_display(body) {
-                    cg.overridable_defaults.insert(name.to_string(), disp);
+        match decl.kind {
+            DeclViewKind::Fun {
+                body: Some(body), ..
+            } => {
+                let name = decl.name;
+                if name == "main" {
+                    continue;
+                }
+                if let Some((_, 0)) = cg.global_fns.get(name)
+                    && let Some(ty_str) = type_info.get(name)
+                    && let Some(base_type) =
+                        scalar_override_type(ty_str, &cg.type_aliases, &cg.refined_types)
+                {
+                    cg.overridable_constants.insert(name.to_string(), base_type);
+                    if let Some(disp) = format_default_value_display(body) {
+                        cg.overridable_defaults.insert(name.to_string(), disp);
+                    }
                 }
             }
+            DeclViewKind::Arg { default } => {
+                // `#name value` / `#name _` — CLI-settable. Register as
+                // overridable if the type is scalar; required args (no
+                // default) are handled by the ArgDecl codegen arm.
+                let name = decl.name;
+                if let Some(ty_str) = type_info.get(name)
+                    && let Some(base_type) =
+                        scalar_override_type(ty_str, &cg.type_aliases, &cg.refined_types)
+                {
+                    cg.overridable_constants.insert(name.to_string(), base_type);
+                    if let Some(d) = default
+                        && let Some(disp) = format_default_value_display(d)
+                    {
+                        cg.overridable_defaults.insert(name.to_string(), disp);
+                    }
+                }
+            }
+            _ => {}
         }
     }
     // Validate and store compile-time overrides
@@ -6326,6 +6345,97 @@ ast::ExprKind::Atomic(inner) => {
                 // routes. The record field carries no runtime value.
                 self.call_rt(builder, "knot_value_unit", &[])
             }
+
+            ast::ExprKind::ArgDecl { name, default } => {
+                // A CLI-settable definition. At runtime, look up the override
+                // (`--<name>=<value>`). If present, use it. Otherwise:
+                // optional args use the default; required args (`#name _`)
+                // abort with an error.
+                let type_str = self.overridable_constants.get(name.as_str()).cloned();
+                let type_tag: Option<i64> = type_str.as_deref().and_then(|s| match s {
+                    "Int" => Some(0),
+                    "Float" => Some(1),
+                    "Text" => Some(2),
+                    "Bool" => Some(3),
+                    "Maybe Int" => Some(4),
+                    "Maybe Float" => Some(5),
+                    "Maybe Text" => Some(6),
+                    "Maybe Bool" => Some(7),
+                    _ => None,
+                });
+                if let Some(type_tag) = type_tag {
+                    let (name_ptr, name_len) = self.string_ptr(builder, name);
+                    let tag = builder.ins().iconst(types::I32, type_tag);
+                    let override_val =
+                        self.call_rt(builder, "knot_override_lookup", &[name_ptr, name_len, tag]);
+
+                    match default {
+                        Some(d) => {
+                            // Optional: use override if present, else the default.
+                            // Use a merge block so both paths produce a value.
+                            let default_block = builder.create_block();
+                            let override_block = builder.create_block();
+                            let merge_block = builder.create_block();
+                            builder.append_block_param(merge_block, self.ptr_type);
+                            let is_null =
+                                builder.ins().icmp_imm(IntCC::Equal, override_val, 0);
+                            builder
+                                .ins()
+                                .brif(is_null, default_block, &[], override_block, &[]);
+
+                            builder.switch_to_block(override_block);
+                            builder.seal_block(override_block);
+                            builder.ins().jump(merge_block, &[override_val.into()]);
+
+                            builder.switch_to_block(default_block);
+                            builder.seal_block(default_block);
+                            let default_val =
+                                self.compile_expr(builder, d.as_ref(), env, db);
+                            builder.ins().jump(merge_block, &[default_val.into()]);
+
+                            builder.switch_to_block(merge_block);
+                            builder.seal_block(merge_block);
+                            builder.block_params(merge_block)[0]
+                        }
+                        None => {
+                            // Required: abort if the flag is missing.
+                            let missing_block = builder.create_block();
+                            let ok_block = builder.create_block();
+                            let is_null =
+                                builder.ins().icmp_imm(IntCC::Equal, override_val, 0);
+                            builder
+                                .ins()
+                                .brif(is_null, missing_block, &[], ok_block, &[]);
+                            builder.switch_to_block(missing_block);
+                            builder.seal_block(missing_block);
+                            let (msg_ptr, msg_len) = self.string_ptr(
+                                builder,
+                                &format!("missing required argument --{}", name),
+                            );
+                            let _ = self.call_rt(builder, "knot_todo", &[msg_ptr, msg_len]);
+                            builder.ins().jump(ok_block, &[]);
+                            builder.switch_to_block(ok_block);
+                            builder.seal_block(ok_block);
+                            override_val
+                        }
+                    }
+                } else {
+                    // Non-scalar type — no CLI parser. Fall through to the
+                    // default (or error for required args).
+                    match default {
+                        Some(d) => self.compile_expr(builder, d.as_ref(), env, db),
+                        None => {
+                            self.diagnostics.push(knot::diagnostic::Diagnostic::error(
+                                format!(
+                                    "argument `#{}` has a non-scalar type and cannot be set from the command line",
+                                    name
+                                ),
+                            ));
+                            self.call_rt(builder, "knot_value_unit", &[])
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -6488,6 +6598,7 @@ ast::ExprKind::Atomic(inner) => {
                 .all(|h| self.collect_direct_write_targets(&h.body, out)),
             Lit(_) | Constructor(_) | SourceRef { .. } => true,
             TypeCtor { .. } | SourceDecl { .. } | SubsetConstraint { .. } => true,
+            ast::ExprKind::ArgDecl { .. } => true,
         }
     }
 
@@ -13372,7 +13483,7 @@ ast::ExprKind::Atomic(inner) => {
             ast::ExprKind::TypeLiteral(_) => false,
             ast::ExprKind::Lit(_) | ast::ExprKind::Var(_) | ast::ExprKind::Constructor(_) => false,
             ast::ExprKind::TypeCtor { .. }
-            | ast::ExprKind::SourceDecl { .. }
+            | ast::ExprKind::SourceDecl { .. } | ast::ExprKind::ArgDecl { .. }
             | ast::ExprKind::SubsetConstraint { .. } => false,
             ast::ExprKind::RouteDecl { .. } => false,
             ast::ExprKind::Record(fields) => fields
@@ -18786,7 +18897,7 @@ fn beta_reduce_inner(
         | Annot { .. }
         | Refine(_)
         | Serve { .. }
-        | TypeCtor { .. }
+        | TypeCtor { .. } | ast::ExprKind::ArgDecl { .. }
         | SourceDecl { .. } => return expr.clone(),
     };
     ast::Spanned {
@@ -18822,7 +18933,7 @@ fn substitute_inner(
         | CollectFold(_)
         | TypeHole
         | TypeLiteral(_)
-        | TypeCtor { .. }
+        | TypeCtor { .. } | ast::ExprKind::ArgDecl { .. }
         | SourceDecl { .. }
         | SubsetConstraint { .. }
         | RouteDecl { .. } => return Some(expr.clone()),
@@ -18948,7 +19059,7 @@ fn expr_mentions_var(expr: &ast::Expr, var: &str) -> bool {
         | CollectFold(_)
         | TypeHole
         | TypeLiteral(_)
-        | TypeCtor { .. }
+        | TypeCtor { .. } | ast::ExprKind::ArgDecl { .. }
         | SourceDecl { .. }
         | SubsetConstraint { .. }
         | RouteDecl { .. } => false,
@@ -18998,7 +19109,7 @@ fn collect_free_vars_set(expr: &ast::Expr, bound: &HashSet<String>, free: &mut H
         | CollectFold(_)
         | TypeHole
         | TypeLiteral(_)
-        | TypeCtor { .. }
+        | TypeCtor { .. } | ast::ExprKind::ArgDecl { .. }
         | SourceDecl { .. }
         | SubsetConstraint { .. }
         | RouteDecl { .. } => {}
@@ -20222,6 +20333,7 @@ fn collect_free_vars(expr: &ast::Expr, bound: &HashSet<&str>, free: &mut Vec<Str
         ast::ExprKind::Lit(_) | ast::ExprKind::Constructor(_) => {}
         ast::ExprKind::SourceRef { .. } => {}
         ast::ExprKind::SourceDecl { .. } => {}
+        ast::ExprKind::ArgDecl { .. } => {},
         ast::ExprKind::SubsetConstraint { .. } => {}
         ast::ExprKind::RouteDecl { .. } => {}
         ast::ExprKind::ImplicitRef(_) => {}
@@ -20389,7 +20501,7 @@ pub(crate) fn expr_refs_var(expr: &ast::Expr, var: &str) -> bool {
         | ast::ExprKind::TypeHole => false,
         | ast::ExprKind::TypeLiteral(_) => false,
         ast::ExprKind::TypeCtor { .. }
-        | ast::ExprKind::SourceDecl { .. }
+        | ast::ExprKind::SourceDecl { .. } | ast::ExprKind::ArgDecl { .. }
         | ast::ExprKind::SubsetConstraint { .. } => false,
         ast::ExprKind::RouteDecl { .. } => false,
         ast::ExprKind::FieldAccess { expr: e, .. } => expr_refs_var(e, var),
@@ -20482,7 +20594,7 @@ fn expr_uses_var_as_value(expr: &ast::Expr, var: &str) -> bool {
         | ast::ExprKind::TypeHole => false,
         | ast::ExprKind::TypeLiteral(_) => false,
         ast::ExprKind::TypeCtor { .. }
-        | ast::ExprKind::SourceDecl { .. }
+        | ast::ExprKind::SourceDecl { .. } | ast::ExprKind::ArgDecl { .. }
         | ast::ExprKind::SubsetConstraint { .. } => false,
         ast::ExprKind::RouteDecl { .. } => false,
         // `var.field` is a ROW use, not a value use — the whole point of this
@@ -20803,6 +20915,12 @@ fn pretty_expr(expr: &ast::Expr) -> String {
         }
         ast::ExprKind::RouteDecl { name, .. } => {
             format!("route {}", name)
+        }
+        ast::ExprKind::ArgDecl { name, default } => {
+            match default {
+                Some(d) => format!("#{} {}", name, pretty_expr(d)),
+                None => format!("#{} _", name),
+            }
         }
         ast::ExprKind::SourceRef { name, .. } => format!("*{}", name),
         ast::ExprKind::Record(fields) => {

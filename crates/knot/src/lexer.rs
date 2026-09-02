@@ -53,6 +53,10 @@ pub enum TokenKind {
     /// whitespace, so a `*` directly abutting a lowercase letter is always a
     /// source identifier, never multiplication.
     StarIdent(String),
+    /// `#name` — an argument-identifier token for a CLI-settable definition
+    /// (`#port 8080`, `#name _`). Like `StarIdent`, the `#` must directly abut
+    /// a lowercase letter; the string includes the leading `#`.
+    HashIdent(String),
     Slash,
     Percent,
     PlusPlus,
@@ -123,6 +127,7 @@ impl TokenKind {
             TokenKind::Minus => "'-'",
             TokenKind::Star => "'*'",
             TokenKind::StarIdent(_) => "source identifier",
+            TokenKind::HashIdent(_) => "argument identifier",
             TokenKind::Slash => "'/'",
             TokenKind::Percent => "'%'",
             TokenKind::PlusPlus => "'++'",
@@ -927,6 +932,26 @@ impl<'src> Lexer<'src> {
                     TokenKind::StarIdent(self.slice(start, self.pos).to_owned())
                 } else {
                     TokenKind::Star
+                }
+            }
+            b'#' => {
+                // `#name` (no space, lowercase letter immediately after) is an
+                // argument identifier — a single HashIdent token whose string
+                // includes the `#`. A `#` not followed by a lowercase letter is
+                // an error (there is no bare-`#` operator).
+                if matches!(self.peek(), Some(b) if b.is_ascii_lowercase()) {
+                    let start = self.pos - 1; // include the consumed `#`
+                    while self.is_ident_continue() {
+                        self.advance();
+                    }
+                    TokenKind::HashIdent(self.slice(start, self.pos).to_owned())
+                } else {
+                    let span = self.span_from(self.pos - 1);
+                    self.diagnostics.push(
+                        Diagnostic::error("unexpected '#'")
+                            .label(span, "expected a lowercase name after '#' (e.g. `#port`)"),
+                    );
+                    return None;
                 }
             }
             b'/' => TokenKind::Slash,

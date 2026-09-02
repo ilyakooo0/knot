@@ -2486,9 +2486,53 @@ impl Parser {
                 }
                 let is_sig = ty.is_some()
                     && had_gap
-                    && matches!(self.peek(), TokenKind::Lower(_) | TokenKind::StarIdent(_));
+                    && matches!(self.peek(), TokenKind::Lower(_) | TokenKind::StarIdent(_) | TokenKind::HashIdent(_));
                 if is_sig {
                     let ty = ty.unwrap();
+                    if matches!(self.peek(), TokenKind::HashIdent(_)) {
+                        // Type-first argument declaration: `Type  #name  default`
+                        // or `Type  #name  _` (required). The type is known
+                        // statically, so the CLI parser knows how to parse it.
+                        let t = self.advance();
+                        let TokenKind::HashIdent(n) = t.kind else {
+                            unreachable!()
+                        };
+                        let bare = n.trim_start_matches('#').to_string();
+                        self.skip_newlines();
+                        let default = if self.at(&TokenKind::Underscore) {
+                            self.advance();
+                            None
+                        } else {
+                            let v = if self.at(&TokenKind::Backslash) || self.at(&TokenKind::Pipe) {
+                                let prev_bi = self.block_indent;
+                                let prev_bd = self.block_delim;
+                                self.block_indent = self.cur_column();
+                                self.block_delim = self.delimiter_depth;
+                                let v = if self.at(&TokenKind::Backslash) {
+                                    self.parse_lambda()
+                                } else {
+                                    self.parse_do_expr()
+                                };
+                                self.block_indent = prev_bi;
+                                self.block_delim = prev_bd;
+                                v
+                            } else {
+                                self.parse_postfix()
+                            };
+                            let Some(v) = v else {
+                                self.error("expected default value or `_` after argument name");
+                                return None;
+                            };
+                            Some(Box::new(v))
+                        };
+                        fields.push(RecordField {
+                            name: crate::ast::FieldName::Named(bare.clone()),
+                            value: Spanned::new(ExprKind::ArgDecl { name: bare, default }, t.span),
+                            sig: Some(ty),
+                            doc: pending_doc.take(),
+                        });
+                        continue;
+                    }
                     if matches!(self.peek(), TokenKind::StarIdent(_)) {
                         // Type-first source declaration: `Rel T  *name` (with an
                         // optional migration clause — a bare lambda below it). The source IS
@@ -2621,6 +2665,49 @@ impl Parser {
                 continue;
             }
             let field_col = self.cur_column();
+            // `#name value` / `#name _` — a CLI-settable definition. The field
+            // is literally named `#name`; the value is a marker (`ArgDecl`).
+            // `_` makes the argument required (no default); any other
+            // expression is the default value (optional argument).
+            if let TokenKind::HashIdent(hname) = self.peek().clone() {
+                let hspan = self.span();
+                self.advance();
+                let bare = hname.trim_start_matches('#').to_string();
+                self.skip_newlines();
+                let default = if self.at(&TokenKind::Underscore) {
+                    self.advance();
+                    None
+                } else {
+                    let v = if self.at(&TokenKind::Backslash) || self.at(&TokenKind::Pipe) {
+                        let prev_bi = self.block_indent;
+                        let prev_bd = self.block_delim;
+                        self.block_indent = field_col;
+                        self.block_delim = self.delimiter_depth;
+                        let v = if self.at(&TokenKind::Backslash) {
+                            self.parse_lambda()
+                        } else {
+                            self.parse_do_expr()
+                        };
+                        self.block_indent = prev_bi;
+                        self.block_delim = prev_bd;
+                        v
+                    } else {
+                        self.parse_postfix()
+                    };
+                    let Some(v) = v else {
+                        self.error("expected default value or `_` after argument name");
+                        return None;
+                    };
+                    Some(Box::new(v))
+                };
+                fields.push(RecordField {
+                    name: crate::ast::FieldName::Named(bare.clone()),
+                    value: Spanned::new(ExprKind::ArgDecl { name: bare, default }, hspan),
+                    sig: None,
+                    doc: pending_doc.take(),
+                });
+                continue;
+            }
             // `_ value` — an absent key: a stored field with no usable name.
             // `_` is not a valid identifier, so the field is unreachable by
             // `.field` access; it is reachable only by `^` (implicit projection)

@@ -193,7 +193,7 @@ ExprKind::Do(stmts) => {
         | ExprKind::TypeLiteral(_)
         | ExprKind::TypeHole => {}
         ExprKind::TypeCtor { .. }
-        | ExprKind::SourceDecl { .. }
+        | ExprKind::SourceDecl { .. } | ExprKind::ArgDecl { .. }
         | ExprKind::SubsetConstraint { .. }
         | ExprKind::RouteDecl { .. } => {}
     }
@@ -925,7 +925,7 @@ fn references_source(expr: &Expr, source_name: &str) -> bool {
         | ExprKind::TypeLiteral(_)
         | ExprKind::TypeHole => false,
         ExprKind::TypeCtor { .. }
-        | ExprKind::SourceDecl { .. }
+        | ExprKind::SourceDecl { .. } | ExprKind::ArgDecl { .. }
         | ExprKind::SubsetConstraint { .. }
         | ExprKind::RouteDecl { .. } => false,
         ExprKind::Record(fields) => fields

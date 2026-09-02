@@ -346,6 +346,17 @@ pub enum ExprKind {
         api_span: Span,
         handlers: Vec<ServeHandler>,
     },
+
+    /// `#name value` or `#name _` — a CLI-settable definition embedded in a
+    /// record value literal. The field is literally named `#name`; the value
+    /// is a marker. `default: Some(expr)` makes the argument optional (the
+    /// expr is the fallback); `default: None` (written as `_`) makes it
+    /// required — the program errors at startup if the flag is absent.
+    ArgDecl {
+        /// Field name WITHOUT the leading `#` (e.g. `port`).
+        name: Name,
+        default: Option<Box<Expr>>,
+    },
 }
 
 /// A single endpoint binding inside a `serve` expression.

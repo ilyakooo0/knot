@@ -432,6 +432,7 @@ fn shift_expr_spans(e: &mut ast::Expr, offset: usize) {
         | CollectFold(_)
         | TypeHole => {}
         TypeCtor { .. } | SourceDecl { .. } | SubsetConstraint { .. } => {}
+        ast::ExprKind::ArgDecl { .. } => {},
         RouteDecl { .. } => {}
     }
 }

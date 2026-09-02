@@ -581,6 +581,12 @@ impl<'a> TokenCollector<'a> {
             ast::ExprKind::SourceDecl { ty, .. } => self.visit_type(ty),
             // A subset constraint carries no type or value tokens.
             ast::ExprKind::SubsetConstraint { .. } => {}
+            // An arg declaration's default is a value; visit it.
+            ast::ExprKind::ArgDecl { default, .. } => {
+                if let Some(d) = default {
+                    self.visit_expr(d.as_ref());
+                }
+            }
             // A route field's entries carry types to highlight; a composite
             // only names other routes.
             ast::ExprKind::RouteDecl { entries, .. } => {

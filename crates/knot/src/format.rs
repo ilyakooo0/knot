@@ -874,6 +874,13 @@ fn render_expr_inline(e: &Expr, parent: Prec) -> String {
             }
             s
         }
+        ExprKind::ArgDecl { name, default } => {
+            // `#name value` / `#name _` — a CLI-settable definition.
+            match default {
+                Some(d) => format!("#{} {}", name, render_expr_inline(d, Prec::Lowest)),
+                None => format!("#{} _", name),
+            }
+        }
         ExprKind::Serve { api, handlers, .. } => {
             let mut s = format!("serve {} where", api);
             // The first handler follows `where` directly; `;` only separates

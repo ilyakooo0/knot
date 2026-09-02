@@ -43,6 +43,11 @@ pub enum DeclViewKind<'a> {
         sub: &'a ast::RelationPath,
         sup: &'a ast::RelationPath,
     },
+    /// `#name value` / `#name _` — a CLI-settable definition.
+    /// `default` is the fallback value expression (None = required).
+    Arg {
+        default: Option<&'a ast::Expr>,
+    },
 }
 
 /// A single declaration discovered in the program.
@@ -141,6 +146,13 @@ fn collect<'a>(e: &'a ast::Expr, out: &mut Vec<DeclView<'a>>) {
                     name: fl.name.expect_named(),
                     span: fl.value.span,
                     kind: DeclViewKind::Subset { sub, sup },
+                }),
+                ArgDecl { name, default } => out.push(DeclView {
+                    name,
+                    span: fl.value.span,
+                    kind: DeclViewKind::Arg {
+                        default: default.as_ref().map(|b| b.as_ref()),
+                    },
                 }),
                 _ => {
                     // A named value/function: any record field whose value

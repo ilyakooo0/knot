@@ -462,6 +462,7 @@ fn walk_exprs(e: &Expr, f: &mut impl FnMut(&Expr)) {
         | ExprKind::TypeCtor { .. }
         | ExprKind::SourceDecl { .. }
         | ExprKind::SubsetConstraint { .. }
+        | ExprKind::ArgDecl { .. }
         | ExprKind::RouteDecl { .. } => {}
     }
 }

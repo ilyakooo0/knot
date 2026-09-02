@@ -231,6 +231,7 @@ fn collect_edges(
         | ast::ExprKind::SourceRef { .. }
         | ast::ExprKind::TypeHole => {}
         ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } | ast::ExprKind::SourceDecl { .. } | ast::ExprKind::SubsetConstraint { .. } | ast::ExprKind::RouteDecl { .. } | ast::ExprKind::RouteCompositeDecl { .. } => {}
+        ExprKind::ArgDecl { .. } => {},
         ast::ExprKind::ViewDecl { body, .. } => {
             collect_edges(body, polarity, node_names, env, partial_diffs, diff_wrappers, out)
         }

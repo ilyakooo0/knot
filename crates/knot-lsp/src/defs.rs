@@ -539,6 +539,12 @@ impl<'a> DefResolver<'a> {
             ast::ExprKind::SourceDecl { ty, .. } => self.resolve_type(ty, self.source),
             // A subset constraint references relations, not value bindings.
             ast::ExprKind::SubsetConstraint { .. } => {}
+            // An arg declaration's default is a value; the field itself is a marker.
+            ast::ExprKind::ArgDecl { default, .. } => {
+                if let Some(d) = default {
+                    self.resolve_expr(d.as_ref());
+                }
+            }
             // A route field's entries carry navigable types; a composite only
             // references other routes by name.
             ast::ExprKind::RouteDecl { entries, .. } => {

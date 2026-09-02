@@ -7773,6 +7773,16 @@ ast::ExprKind::Atomic(inner) => {
                 // has no meaningful value.
                 Ty::unit()
             }
+            ast::ExprKind::ArgDecl { name: _, default } => {
+                // A CLI-settable definition. The field's type is the type of
+                // the default value (optional arg) or a fresh type variable
+                // that will be resolved from the CLI flag at runtime
+                // (required arg, `#name _`).
+                match default {
+                    Some(d) => self.infer_expr(d),
+                    None => self.fresh(),
+                }
+            }
             ast::ExprKind::RouteDecl { name, entries } => {
                 // A record-embedded route declaration. Like an embedded `data`
                 // decl, its static type is a structural namespace record
@@ -13713,6 +13723,7 @@ fn value_references_source_inner(
         ast::ExprKind::TypeCtor { .. }
         | ast::ExprKind::SourceDecl { .. }
         | ast::ExprKind::SubsetConstraint { .. } => false,
+        ast::ExprKind::ArgDecl { .. } => false,
         ast::ExprKind::RouteDecl { .. } => false,
         ast::ExprKind::Record(fields) => fields.iter().any(|f| {
             value_references_source_inner(&f.value, source_name, aliases, let_bindings, visited)
@@ -15287,6 +15298,7 @@ fn walk_expr_children_mut(expr: &mut ast::Expr, f: &mut impl FnMut(&mut ast::Exp
         TypeHole => {}
         TypeLiteral(_) => {}
         TypeCtor { .. } | SourceDecl { .. } | SubsetConstraint { .. } => {}
+        ArgDecl { .. } => {}
         RouteDecl { .. } => {}
         Record(fields) => {
             for fl in fields {

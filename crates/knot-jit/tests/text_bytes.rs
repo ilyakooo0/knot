@@ -116,5 +116,5 @@ fn take_drop_beyond_length() {
 fn chars_of_text() {
     assert_show("base.chars \"ab\"", "[a, b]");
     assert_show("base.chars \"\"", "[]");
-    assert_show("base.count (base.chars \"héllo\")", "5");
+    assert_show("base.count (base.chars \"héllo\")", "[5]"); // count is a one-element relation now
 }

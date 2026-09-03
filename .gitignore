@@ -4,6 +4,7 @@
 *.db-wal
 .DS_Store
 /.vibe
+/.vix
 .opencode-tmp
 examples/hello
 examples/todo

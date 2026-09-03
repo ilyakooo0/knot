@@ -15623,6 +15623,19 @@ pub extern "C-unwind" fn knot_source_query(
         }
         rows.push(record);
     }
+
+    // A scalar element relation (`{_value T}` schema) stores each element in a
+    // single `_value` column; unwrap the records back to bare element values
+    // (matching `read_child_table`'s scalar-element unwrap and the in-memory
+    // representation set ops/aggregates operate on).
+    if rec.columns.len() == 1 && rec.columns[0].name == "_value" && rec.nested.is_empty() {
+        let unwrapped = rows
+            .iter()
+            .map(|r| knot_record_field(*r, "_value".as_ptr(), 6))
+            .collect();
+        return alloc(Value::Relation(unwrapped));
+    }
+
     alloc(Value::Relation(rows))
 }
 
@@ -21475,9 +21488,8 @@ fn http_serve_loop(addr: String, route_table: *mut c_void, handler: *mut Value) 
                             // Enforce the response body cap (mirrors the
                             // inbound-request and fetch-response ceilings)
                             // so a handler that returns a multi-GB relation
-                            // can't OOM the server. AGENTS.md documents
-                            // `--http-max-body-bytes` as applying to both
-                            // `listen` and `fetch`.
+                            // can't OOM the server. `--http-max-body-bytes`
+                            // applies to both `listen` and `fetch`.
                             let max = http_max_body_bytes();
                             if json.len() as u64 > max {
                                 log_error!(

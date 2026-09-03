@@ -19,7 +19,7 @@ directReports (|
   *manages = [{manager "A"  report "B"}  {manager "A"  report "C"}  {manager "B"  report "D"}]
   base.println (base.show (base.count directReports))
   yield {})"#,
-        "\"3\"\n{}",
+        "\"[3]\"\n{}",
     );
 }
 
@@ -61,7 +61,8 @@ amounts (|
   *sales = [{region "x"  amount 10}  {region "y"  amount 20}  {region "x"  amount 5}]
   base.println (base.show {sum (base.sum (| r <- amounts; yield r.amount))})
   yield {})"#,
-        // a query field iterated in an aggregate comprehension over the source
-        "\"{sum 35}\"\n{}",
+        // a query field iterated in an aggregate comprehension over the source;
+        // sum is a one-element relation now, so the record shows `{sum [35]}`
+        "\"{sum [35]}\"\n{}",
     );
 }

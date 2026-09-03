@@ -64,12 +64,13 @@ fn map_to_record() {
 
 #[test]
 fn fold_sum() {
-    assert_show("base.fold (\\a b -> a + b) 0 [1  2  3  4]", "10");
+    // fold is a one-element relation now (Rel b); extract with run1.
+    assert_show("base.fold (\\a b -> a + b) 0 [1  2  3  4]", "[10]");
 }
 
 #[test]
 fn fold_empty() {
-    assert_show("base.fold (\\a b -> a + b) 42 (base.the (Rel (Int 1)) [])", "42");
+    assert_show("base.fold (\\a b -> a + b) 42 (base.the (Rel (Int 1)) [])", "[42]");
 }
 
 #[test]
@@ -85,12 +86,13 @@ fn bind_flatmap() {
 
 #[test]
 fn count_basic() {
-    assert_show("base.count [1  2  3  4]", "4");
+    // count is a one-element relation now (Rel Int); extract with run1.
+    assert_show("base.count [1  2  3  4]", "[4]");
 }
 
 #[test]
 fn count_empty() {
-    assert_show("base.count (base.the (Rel (Int 1)) [])", "0");
+    assert_show("base.count (base.the (Rel (Int 1)) [])", "[0]");
 }
 
 #[test]
@@ -100,22 +102,24 @@ fn count_where() {
 
 #[test]
 fn sum_ints() {
-    assert_show("base.sum [1  2  3  4]", "10");
+    // sum is a one-element relation now (Rel a).
+    assert_show("base.sum [1  2  3  4]", "[10]");
 }
 
 #[test]
 fn avg_floats() {
-    // base.avg takes a projection function: (a -> Float u) -> [a] -> Float u.
-    assert_show("base.avg (\\x -> x) [1.0  2.0  3.0]", "2.0");
+    // base.avg takes a projection function and returns a one-element relation
+    // (Rel (Float u)).
+    assert_show("base.avg (\\x -> x) [1.0  2.0  3.0]", "[2.0]");
 }
 
 #[test]
 fn min_on() {
-    // minOn/maxOn return the bare projected key (b), NOT Maybe — and panic on
-    // an empty relation (see the note at the bottom of this file).
+    // minOn/maxOn return a one-element relation of the projected key (Rel b),
+    // and panic on an empty relation (see the note at the bottom of this file).
     assert_show(
         "base.minOn (\\p -> p.age) [{name \"a\"  age 30}  {name \"b\"  age 25}]",
-        "25",
+        "[25]",
     );
 }
 
@@ -123,7 +127,7 @@ fn min_on() {
 fn max_on_basic() {
     assert_show(
         "base.maxOn (\\p -> p.age) [{name \"a\"  age 30}  {name \"b\"  age 25}]",
-        "30",
+        "[30]",
     );
 }
 
@@ -282,7 +286,7 @@ fn mixed_type_relation_rejected() {
 //
 // base.minOn/base.maxOn on an EMPTY relation panic in the runtime
 // ("knot runtime: min/max on empty relation" → SIGABRT). This is the
-// DOCUMENTED contract: both base.md and knot.md specify `-> b` (the bare
-// projected key, no `Nothing` case) and "aborts the program on an empty
-// relation — guard with base.count first". It cannot be exercised in-process
-// (it kills the test runner); verified manually against a compiled binary.
+// intended contract: the return type is `-> b` (the bare projected key, no
+// `Nothing` case), and an empty relation aborts the program — guard with
+// base.count first. It cannot be exercised in-process (it kills the test
+// runner); verified manually against a compiled binary.

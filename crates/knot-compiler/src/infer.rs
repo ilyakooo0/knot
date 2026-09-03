@@ -1011,9 +1011,6 @@ struct Infer {
     /// Source/view relation types: name → full type (always Relation(...)).
     source_types: HashMap<String, Ty>,
 
-    /// Names that are views (for lenient set checking).
-    view_names: HashSet<String>,
-
     /// Type aliases: name → resolved Ty.
     aliases: HashMap<String, Ty>,
 
@@ -1412,7 +1409,6 @@ impl Infer {
             data_types: HashMap::new(),
             builtin_data_types: std::collections::HashSet::new(),
             source_types: HashMap::new(),
-            view_names: HashSet::new(),
             aliases: HashMap::new(),
             param_aliases: HashMap::new(),
             record_type_scopes: Vec::new(),
@@ -6906,9 +6902,8 @@ impl Infer {
                     self.record_type_scopes.push(type_scope);
                 }
                 // Register `with` field bindings in `let_bindings` (scoped to
-                // this body) so `value_references_source` can fold through
-                // them — same treatment `let` bindings got. If the record is
-                // a literal we can record the field expressions precisely.
+                // this body) — same treatment `let` bindings got. If the record
+                // is a literal we record the field expressions precisely.
                 let prev_let_bindings = self.let_bindings.clone();
                 if let ast::ExprKind::Record(field_exprs) = &record.node {
                     for f in field_exprs {
@@ -10059,8 +10054,8 @@ ast::ExprKind::Atomic(inner) => {
                         .map(|f| (f.name.clone(), f.value.clone()))
                         .collect();
                     // NOTE: distinct ADTs may legally share a constructor name —
-                    // see CLAUDE.md "Constructor patterns in case and do-bind
-                    // create open variant types" and the regression tests
+                    // constructor patterns in case and do-bind create open
+                    // variant types; see the regression tests
                     // `case_pattern_infers_open_variant` /
                     // `open_variant_applied_to_multiple_adts`. Row-polymorphic
                     // variants depend on this; an error here would forbid the
@@ -13659,141 +13654,6 @@ fn display_ty_clean_inner(
         // Int/Float `Con`; the `Con` arm renders it. Defensive fallback:
         Ty::Unit(u) => format!("Unit<{}>", display_unit_clean(u, unit_names)),
         Ty::Error => "<error>".into(),
-    }
-}
-
-// ── `set` full-replacement detection ──────────────────────────────
-
-/// Whether `expr` references `*source_name` — either directly via
-/// `SourceRef`, or via a local variable bound to `*source_name`
-/// (e.g. `xs <- *foo`, then `xs` counts as a reference), or via a
-/// `let`-bound expression that itself references the source. Used
-/// to distinguish incremental `set` (must reference the source)
-/// from full replacement (which requires `full *rel = ...`).
-fn value_references_source(
-    expr: &ast::Expr,
-    source_name: &str,
-    aliases: &HashMap<String, String>,
-    let_bindings: &HashMap<String, ast::Expr>,
-) -> bool {
-    let mut visited: HashSet<String> = HashSet::new();
-    value_references_source_inner(expr, source_name, aliases, let_bindings, &mut visited)
-}
-
-fn value_references_source_inner(
-    expr: &ast::Expr,
-    source_name: &str,
-    aliases: &HashMap<String, String>,
-    let_bindings: &HashMap<String, ast::Expr>,
-    visited: &mut HashSet<String>,
-) -> bool {
-    match &expr.node {
-        ast::ExprKind::SourceRef { name, .. } => name == source_name,
-        ast::ExprKind::NameOf(inner) => value_references_source_inner(inner, source_name, aliases, let_bindings, visited),
-        // `^x` reads a record field, never a source relation directly.
-        ast::ExprKind::ImplicitRef(_) => false,
-        // A type literal has no expression content.
-        ast::ExprKind::TypeLiteral(_) => false,
-        // `<>x` likewise reads record fields, never a source relation.
-        ast::ExprKind::CollectFold(_) => false,
-        // `_` hole reads nothing.
-        ast::ExprKind::TypeHole => false,
-        ast::ExprKind::Var(name) => {
-            if aliases.get(name.as_str()).map(|s| s.as_str()) == Some(source_name) {
-                return true;
-            }
-            // Fold through let bindings: `let foo = ...; *rel = foo`
-            // counts as referencing the source if the body does.
-            if visited.insert(name.as_str().to_string())
-                && let Some(body) = let_bindings.get(name.as_str())
-            {
-                let result = value_references_source_inner(
-                    body,
-                    source_name,
-                    aliases,
-                    let_bindings,
-                    visited,
-                );
-                visited.remove(name.as_str());
-                return result;
-            }
-            false
-        }
-        ast::ExprKind::Lit(_) | ast::ExprKind::Constructor(_) => false,
-        ast::ExprKind::TypeCtor { .. }
-        | ast::ExprKind::SourceDecl { .. }
-        | ast::ExprKind::SubsetConstraint { .. } => false,
-        ast::ExprKind::ArgDecl { .. } => false,
-        ast::ExprKind::RouteDecl { .. } => false,
-        ast::ExprKind::Record(fields) => fields.iter().any(|f| {
-            value_references_source_inner(&f.value, source_name, aliases, let_bindings, visited)
-        }),
-        ast::ExprKind::FieldAccess { expr, .. } => {
-            value_references_source_inner(expr, source_name, aliases, let_bindings, visited)
-        }
-        ast::ExprKind::List(elems) => elems
-            .iter()
-            .any(|e| value_references_source_inner(e, source_name, aliases, let_bindings, visited)),
-        ast::ExprKind::Lambda { body, .. } => {
-            value_references_source_inner(body, source_name, aliases, let_bindings, visited)
-        }
-        ast::ExprKind::App { func, arg } => {
-            value_references_source_inner(func, source_name, aliases, let_bindings, visited)
-                || value_references_source_inner(arg, source_name, aliases, let_bindings, visited)
-        }
-        ast::ExprKind::With { record, body, .. } => {
-            value_references_source_inner(record, source_name, aliases, let_bindings, visited)
-                || value_references_source_inner(body, source_name, aliases, let_bindings, visited)
-        }
-        ast::ExprKind::BinOp { lhs, rhs, .. } => {
-            value_references_source_inner(lhs, source_name, aliases, let_bindings, visited)
-                || value_references_source_inner(rhs, source_name, aliases, let_bindings, visited)
-        }
-        ast::ExprKind::UnaryOp { operand, .. } => {
-            value_references_source_inner(operand, source_name, aliases, let_bindings, visited)
-        }
-        ast::ExprKind::Case { scrutinee, arms } => {
-            value_references_source_inner(scrutinee, source_name, aliases, let_bindings, visited)
-                || arms.iter().any(|a| {
-                    value_references_source_inner(
-                        &a.body,
-                        source_name,
-                        aliases,
-                        let_bindings,
-                        visited,
-                    )
-                })
-        }
-        ast::ExprKind::Do(stmts) => stmts.iter().any(|s| match &s.node {
-            ast::StmtKind::Bind { expr, .. } => {
-                value_references_source_inner(expr, source_name, aliases, let_bindings, visited)
-            }
-            ast::StmtKind::Where { cond } => {
-                value_references_source_inner(cond, source_name, aliases, let_bindings, visited)
-            }
-            ast::StmtKind::GroupBy { key } => {
-                value_references_source_inner(key, source_name, aliases, let_bindings, visited)
-            }
-            ast::StmtKind::Expr(e) => {
-                value_references_source_inner(e, source_name, aliases, let_bindings, visited)
-            }
-        }),
-        ast::ExprKind::Set { target, value } => {
-            value_references_source_inner(target, source_name, aliases, let_bindings, visited)
-                || value_references_source_inner(value, source_name, aliases, let_bindings, visited)
-        }
-        ast::ExprKind::Atomic(inner) | ast::ExprKind::Refine(inner) => {
-            value_references_source_inner(inner, source_name, aliases, let_bindings, visited)
-        }
-        ast::ExprKind::TimeUnitLit { value, .. } => {
-            value_references_source_inner(value, source_name, aliases, let_bindings, visited)
-        }
-        ast::ExprKind::Annot { expr, .. } => {
-            value_references_source_inner(expr, source_name, aliases, let_bindings, visited)
-        }
-        ast::ExprKind::Serve { handlers, .. } => handlers.iter().any(|h| {
-            value_references_source_inner(&h.body, source_name, aliases, let_bindings, visited)
-        }),
     }
 }
 

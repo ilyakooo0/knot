@@ -8914,9 +8914,12 @@ ast::ExprKind::Atomic(inner) => {
             }
             ast::ExprKind::Var(name) if name == "count" => {
                 if compiled_args.len() == 1 {
-                    // knot_relation_len returns raw usize, pass directly to knot_value_int
+                    // knot_relation_len returns raw usize, pass directly to knot_value_int.
+                    // count : Rel a -> Rel Int — a one-element relation (same as the
+                    // `base.count` record field, see define_stdlib_count).
                     let len = self.call_rt(builder, "knot_relation_len", &[compiled_args[0]]);
-                    self.call_rt(builder, "knot_value_int", &[len])
+                    let n = self.call_rt(builder, "knot_value_int", &[len]);
+                    self.call_rt(builder, "knot_relation_singleton", &[n])
                 } else {
                     self.call_rt(builder, "knot_value_unit", &[])
                 }
@@ -11265,7 +11268,7 @@ ast::ExprKind::Atomic(inner) => {
                     // written directly as the block's trailing statements.
                     //
                     // Both readings of `x <- *rel` are legal, so the bound
-                    // name's USES pick between them: DESIGN.md's
+                    // name's USES pick between them:
                     // `&seniors = do { people <- *people;
                     //                  yield (filter (\p -> p.age > 65) people) }`
                     // passes the name on as the whole relation, while the
@@ -16644,17 +16647,6 @@ ast::ExprKind::Atomic(inner) => {
     /// every codegen path that emits one of them must call this for every
     /// table the query touches — otherwise an STM `retry` watching the
     /// table is never woken by writes to it.
-    /// Whether the full-read warning is suppressed for the `run`/`run1` call at
-    /// `span` — a `-- allow full read` comment on that line (a trailing comment).
-    fn suppresses_full_read_warning(&self, span: ast::Span) -> bool {
-        let (line, _) = knot::diagnostic::line_col(&self.source_text, span.start);
-        // Only the run's own line — a trailing `-- allow full read` on it.
-        self.source_text
-            .lines()
-            .nth(line.saturating_sub(1))
-            .is_some_and(|l| l.contains("-- allow full read"))
-    }
-
     fn emit_stm_track_read(&mut self, builder: &mut FunctionBuilder, source_name: &str) {
         let (tn_ptr, tn_len) = self.string_ptr(builder, source_name);
         self.call_rt_void(builder, "knot_stm_track_read", &[tn_ptr, tn_len]);
@@ -17961,7 +17953,13 @@ impl Query {
                         .join(", ");
                     format!("SELECT {} FROM ({})", order_cols, right.sql)
                 };
-                format!("{} {} {}", left.sql, op, right_sql)
+                // SQLite precedence: INTERSECT binds tighter than UNION/EXCEPT,
+                // so wrap each side in a no-op subquery to force the intended
+                // grouping (a bare `(SELECT …)` parenthesis is a syntax error).
+                format!(
+                    "SELECT * FROM ({}) {} SELECT * FROM ({})",
+                    left.sql, op, right_sql
+                )
             }
             QueryTerminal::Rows => {
                 // Two Rows flavors. The single-source paths (sortBy / take /
@@ -19374,9 +19372,11 @@ fn relation_literal_to_sql(expr: &ast::Expr) -> Option<String> {
     Some(parts.join(" UNION ALL "))
 }
 
-/// The schema descriptor for an in-memory relation literal — `{_value Int 1}`
-/// for scalar rows, `{name Text  age (Int 1)}` for record rows. Matches the
-/// source-schema form so downstream column lookups resolve. Returns None for an
+/// The schema descriptor for an in-memory relation literal — `{_value Int}`
+/// for scalar rows, `{name Text  age Int}` for record rows. Matches the
+/// source-schema form (`record_desc`/`scalar_type_str` emit bare `Int`/`Float`
+/// — the runtime's `parse_record_body` does not accept a unit suffix) so
+/// downstream column lookups resolve. Returns None for an
 /// empty list or a non-literal row.
 fn relation_literal_schema(expr: &ast::Expr) -> Option<String> {
     let ast::ExprKind::List(rows) = &expr.node else {
@@ -19384,8 +19384,8 @@ fn relation_literal_schema(expr: &ast::Expr) -> Option<String> {
     };
     let first = rows.first()?;
     match &first.node {
-        ast::ExprKind::Lit(ast::Literal::Int(_)) => Some("{_value Int 1}".to_string()),
-        ast::ExprKind::Lit(ast::Literal::Float(_)) => Some("{_value Float 1}".to_string()),
+        ast::ExprKind::Lit(ast::Literal::Int(_)) => Some("{_value Int}".to_string()),
+        ast::ExprKind::Lit(ast::Literal::Float(_)) => Some("{_value Float}".to_string()),
         ast::ExprKind::Lit(ast::Literal::Text(_)) => Some("{_value Text}".to_string()),
         ast::ExprKind::Record(fields) => {
             let inner = fields
@@ -19393,8 +19393,8 @@ fn relation_literal_schema(expr: &ast::Expr) -> Option<String> {
                 .map(|f| {
                     let n = f.name.as_name()?;
                     let ty = match &f.value.node {
-                        ast::ExprKind::Lit(ast::Literal::Int(_)) => Some("Int 1"),
-                        ast::ExprKind::Lit(ast::Literal::Float(_)) => Some("Float 1"),
+                        ast::ExprKind::Lit(ast::Literal::Int(_)) => Some("Int"),
+                        ast::ExprKind::Lit(ast::Literal::Float(_)) => Some("Float"),
                         ast::ExprKind::Lit(ast::Literal::Text(_)) => Some("Text"),
                         _ => None,
                     }?;
@@ -20572,7 +20572,7 @@ pub(crate) fn expr_refs_var(expr: &ast::Expr, var: &str) -> bool {
 /// count as a reference: it reports only uses of `var` as a *whole value* —
 /// passed to a function (`filter pred people`), yielded, compared, and so on.
 ///
-/// A do-block bind from a relation source is ambiguous on its own: DESIGN.md's
+/// A do-block bind from a relation source is ambiguous on its own:
 /// `&seniors = do { people <- *people; yield (filter … people) }` binds the
 /// WHOLE relation, while `do { p <- *people; where p.age > 27; yield p.name }`
 /// binds each ROW. The bound name's use sites are what tell them apart, so
